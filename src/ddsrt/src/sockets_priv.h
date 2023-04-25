@@ -1,3 +1,4 @@
+/*
 // Copyright(c) 2006 to 2022 ZettaScale Technology and others
 //
 // This program and the accompanying materials are made available under the
@@ -7,7 +8,7 @@
 // http://www.eclipse.org/org/documents/edl-v10.php.
 //
 // SPDX-License-Identifier: EPL-2.0 OR BSD-3-Clause
-
+*/
 #ifndef DDSRT_SOCKETS_PRIV_H
 #define DDSRT_SOCKETS_PRIV_H
 
