@@ -339,6 +339,7 @@ typedef struct dds_publisher {
 #ifdef DDS_HAS_TOPIC_DISCOVERY
 /* complete type_id -> <topic guid, ddsi topic> mapping for ktopics */
 struct ktopic_type_guid {
+  ddsrt_avl_node_t avlnode;
   ddsi_typeid_t *type_id;
   uint32_t refc;
   ddsi_guid_t guid;
@@ -360,7 +361,7 @@ typedef struct dds_ktopic {
   dds_qos_t *qos;
   char *name; /* [constant] */
 #ifdef DDS_HAS_TOPIC_DISCOVERY
-  struct ddsrt_hh *topic_guid_map; /* mapping of this ktopic to ddsi topics */
+  ddsrt_avl_tree_t topic_guid_tree; /* mapping of this ktopic to ddsi topics */
 #endif
 } dds_ktopic;
 

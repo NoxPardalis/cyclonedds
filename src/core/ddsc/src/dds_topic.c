@@ -79,6 +79,10 @@ static dds_return_t dds_topic_status_validate (uint32_t mask)
   return (mask & ~DDS_TOPIC_STATUS_MASK) ? DDS_RETCODE_BAD_PARAMETER : DDS_RETCODE_OK;
 }
 
+static int ktopic_type_guid_compare(const void *ktp_guid_a, const void *ktp_guid_b);
+// TODO should I embed this in the dds_ktopic?
+static ddsrt_avl_treedef_t TOPIC_GUID_TREEDEF = DDSRT_AVL_TREEDEF_INITIALIZER(offsetof(struct ktopic_type_guid, avlnode), 0, ktopic_type_guid_compare, NULL);
+
 #ifdef DDS_HAS_TOPIC_DISCOVERY
 static struct ktopic_type_guid * topic_guid_map_refc_impl (const struct dds_ktopic * ktp, const struct ddsi_sertype *sertype, bool unref)
 {
@@ -87,7 +91,7 @@ static struct ktopic_type_guid * topic_guid_map_refc_impl (const struct dds_ktop
   if (ddsi_typeid_is_none (type_id))
     goto no_typeid;
   struct ktopic_type_guid templ = { .type_id = type_id };
-  m = ddsrt_hh_lookup (ktp->topic_guid_map, &templ);
+  m = ddsrt_avl_lookup (&TOPIC_GUID_TREEDEF, &ktp->topic_guid_tree, &templ);
   assert (m != NULL);
   if (unref)
     m->refc--;
@@ -109,7 +113,7 @@ static void topic_guid_map_ref (const struct dds_ktopic * ktp, const struct ddsi
 }
 #endif
 
-static void topic_guid_map_unref (struct ddsi_domaingv * const gv, const struct dds_ktopic * ktp, const struct ddsi_sertype *sertype)
+static void topic_guid_map_unref (struct ddsi_domaingv * const gv, struct dds_ktopic * ktp, const struct ddsi_sertype *sertype)
 {
   struct ktopic_type_guid *m = topic_guid_map_refc_impl (ktp, sertype, true);
   if (m == NULL)
@@ -117,7 +121,7 @@ static void topic_guid_map_unref (struct ddsi_domaingv * const gv, const struct 
 
   if (m->refc == 0)
   {
-    ddsrt_hh_remove_present (ktp->topic_guid_map, m);
+    ddsrt_avl_delete(&TOPIC_GUID_TREEDEF, &ktp->topic_guid_tree, m);
     ddsi_thread_state_awake (ddsi_lookup_thread_state (), gv);
     (void) ddsi_delete_topic (gv, &m->guid);
     ddsi_thread_state_asleep (ddsi_lookup_thread_state ());
@@ -214,7 +218,7 @@ static void ktopic_unref (dds_participant * const pp, struct dds_ktopic * const 
     dds_delete_qos (ktp->qos);
     dds_free (ktp->name);
 #ifdef DDS_HAS_TOPIC_DISCOVERY
-    ddsrt_hh_free (ktp->topic_guid_map);
+    ddsrt_avl_free(&TOPIC_GUID_TREEDEF, &ktp->topic_guid_tree, NULL);
 #endif
     dds_free (ktp);
   }
@@ -252,9 +256,9 @@ static dds_return_t dds_topic_qos_set (dds_entity *e, const dds_qos_t *qos, bool
     struct dds_topic *tp = (struct dds_topic *) e;
     struct dds_ktopic * const ktp = tp->m_ktopic;
     ddsi_thread_state_awake (ddsi_lookup_thread_state (), &e->m_domain->gv);
-    struct ddsrt_hh_iter it;
+    struct ddsrt_avl_iter it;
     /* parent pp is locked and protects ktp->topic_guid_map */
-    for (struct ktopic_type_guid *obj = ddsrt_hh_iter_first(ktp->topic_guid_map, &it); obj; obj = ddsrt_hh_iter_next(&it))
+    for (struct ktopic_type_guid *obj = ddsrt_avl_iter_first(&TOPIC_GUID_TREEDEF, &ktp->topic_guid_tree, &it); obj; obj = ddsrt_avl_iter_next(&it))
     {
       struct ddsi_topic *ddsi_tp;
       if ((ddsi_tp = ddsi_entidx_lookup_topic_guid (e->m_domain->gv.entity_index, &obj->guid)) != NULL)
@@ -350,7 +354,6 @@ static dds_entity_t create_topic_pp_locked (struct dds_participant *pp, struct d
 }
 
 #ifdef DDS_HAS_TOPIC_DISCOVERY
-
 static bool register_topic_type_for_discovery (struct ddsi_domaingv * const gv, dds_participant * const pp, dds_ktopic * const ktp, bool is_builtin, struct ddsi_sertype * const sertype)
 {
   bool new_topic_def = false;
@@ -363,7 +366,7 @@ static bool register_topic_type_for_discovery (struct ddsi_domaingv * const gv, 
     goto free_typeid;
 
   struct ktopic_type_guid templ = { .type_id = type_id }, *m;
-  if ((m = ddsrt_hh_lookup (ktp->topic_guid_map, &templ)))
+  if ((m = ddsrt_avl_lookup (&TOPIC_GUID_TREEDEF, &ktp->topic_guid_tree, &templ)))
   {
     m->refc++;
     goto free_typeid;
@@ -383,7 +386,7 @@ static bool register_topic_type_for_discovery (struct ddsi_domaingv * const gv, 
     dds_return_t rc = ddsi_new_topic (&m->tp, &m->guid, pp_ddsi, ktp->name, sertype, ktp->qos, is_builtin, &new_topic_def);
     assert (rc == DDS_RETCODE_OK); /* FIXME: can be out-of-resources at the very least */
     (void) rc;
-    ddsrt_hh_add_absent (ktp->topic_guid_map, m);
+    ddsrt_avl_insert(&TOPIC_GUID_TREEDEF, &ktp->topic_guid_tree, m);
     ddsi_thread_state_asleep (ddsi_lookup_thread_state ());
   }
 free_typeid:
@@ -395,21 +398,11 @@ free_typeid:
   return new_topic_def;
 }
 
-static bool ktopic_type_guid_equal (const void *ktp_guid_a, const void *ktp_guid_b)
+static int ktopic_type_guid_compare(const void *ktp_guid_a, const void *ktp_guid_b)
 {
   struct ktopic_type_guid *a = (struct ktopic_type_guid *) ktp_guid_a;
   struct ktopic_type_guid *b = (struct ktopic_type_guid *) ktp_guid_b;
-  return ddsi_typeid_compare (a->type_id, b->type_id) == 0;
-}
-
-static uint32_t ktopic_type_guid_hash (const void *ktp_guid)
-{
-  uint32_t hash32;
-  struct ktopic_type_guid *x = (struct ktopic_type_guid *) ktp_guid;
-  DDS_XTypes_EquivalenceHash hash;
-  ddsi_typeid_get_equivalence_hash (x->type_id, &hash);
-  memcpy (&hash32, hash, sizeof (hash32));
-  return hash32;
+  return ddsi_typeid_compare (a->type_id, b->type_id);
 }
 
 #else
@@ -528,7 +521,7 @@ dds_entity_t dds_create_topic_impl (
     ktp->qos = new_qos;
     ktp->name = dds_string_dup (name);
 #ifdef DDS_HAS_TOPIC_DISCOVERY
-    ktp->topic_guid_map = ddsrt_hh_new (1, ktopic_type_guid_hash, ktopic_type_guid_equal);
+    ddsrt_avl_init(&TOPIC_GUID_TREEDEF, &ktp->topic_guid_tree);
 #endif
     ddsrt_avl_insert (&participant_ktopics_treedef, &pp->m_ktopics, ktp);
     GVTRACE ("create_and_lock_ktopic: ktp %p\n", (void *) ktp);
