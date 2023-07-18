@@ -52,6 +52,7 @@ struct ddsi_sertype {
 #ifdef DDS_HAS_SHM
   uint32_t iox_size;
 #endif
+  ddsrt_avl_node_t avlnode;
 };
 
 /* The old and the new happen to have the same memory layout on a 64-bit machine

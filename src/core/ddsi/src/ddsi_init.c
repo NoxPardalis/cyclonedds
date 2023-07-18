@@ -78,6 +78,51 @@
 #include "iceoryx_binding_c/runtime.h"
 #endif
 
+
+static bool ddsi_sertype_equal_wrap (const void *a, const void *b)
+{
+  return ddsi_sertype_equal (a, b);
+}
+
+static uint32_t ddsi_sertype_hash_wrap (const void *tp)
+{
+  return ddsi_sertype_hash (tp);
+}
+
+static int ddsi_sertype_compare (const void *a, const void *b)
+{
+  int ordering = 0;
+  if (!ddsi_sertype_equal_wrap (a, b))
+  {
+    uint32_t hash_a = ddsi_sertype_hash_wrap(a);
+    uint32_t hash_b = ddsi_sertype_hash_wrap(b);
+    ordering = (hash_a > hash_b) - (hash_a < hash_b);
+  }
+  return ordering;
+}
+
+#ifdef DDS_HAS_TOPIC_DISCOVERY
+static bool topic_definition_equal_wrap (const void *tpd_a, const void *tpd_b)
+{
+  return ddsi_topic_definition_equal (tpd_a, tpd_b);
+}
+static uint32_t topic_definition_hash_wrap (const void *tpd)
+{
+  return ddsi_topic_definition_hash (tpd);
+}
+static int topic_definition_compare (const void *a, const void *b)
+{
+  int ordering = 0;
+  if (!topic_definition_equal_wrap (a, b))
+  {
+    uint32_t hash_a = topic_definition_hash_wrap(a);
+    uint32_t hash_b = topic_definition_hash_wrap(b);
+    ordering = (hash_a > hash_b) - (hash_a < hash_b);
+  }
+  return ordering;
+}
+#endif /* DDS_HAS_TYPE_DISCOVERY */
+
 static void add_peer_addresses (const struct ddsi_domaingv *gv, struct ddsi_addrset *as, const struct ddsi_config_peer_listelem *list)
 {
   while (list)
@@ -938,27 +983,6 @@ fail:
   return -1;
 }
 
-static bool ddsi_sertype_equal_wrap (const void *a, const void *b)
-{
-  return ddsi_sertype_equal (a, b);
-}
-
-static uint32_t ddsi_sertype_hash_wrap (const void *tp)
-{
-  return ddsi_sertype_hash (tp);
-}
-
-#ifdef DDS_HAS_TOPIC_DISCOVERY
-static bool topic_definition_equal_wrap (const void *tpd_a, const void *tpd_b)
-{
-  return ddsi_topic_definition_equal (tpd_a, tpd_b);
-}
-static uint32_t topic_definition_hash_wrap (const void *tpd)
-{
-  return ddsi_topic_definition_hash (tpd);
-}
-#endif /* DDS_HAS_TYPE_DISCOVERY */
-
 static void reset_deaf_mute (struct ddsi_domaingv *gv, struct ddsi_xevent *xev, UNUSED_ARG (struct ddsi_xpack *xp), UNUSED_ARG (void *varg), UNUSED_ARG (ddsrt_mtime_t tnow))
 {
   gv->deaf = 0;
@@ -1311,7 +1335,9 @@ int ddsi_init (struct ddsi_domaingv *gv)
   }
 
   ddsrt_mutex_init (&gv->sertypes_lock);
-  gv->sertypes = ddsrt_hh_new (1, ddsi_sertype_hash_wrap, ddsi_sertype_equal_wrap);
+  ddsrt_avl_treedef_t sertypes_treedef = DDSRT_AVL_TREEDEF_INITIALIZER(offsetof(struct ddsi_sertype, avlnode), 0, ddsi_sertype_compare, NULL);
+  gv->sertypes_treedef = sertypes_treedef;
+  ddsrt_avl_init(&gv->sertypes_treedef, &gv->sertypes);
 
 #ifdef DDS_HAS_TYPE_DISCOVERY
   ddsrt_mutex_init (&gv->typelib_lock);
@@ -1325,7 +1351,9 @@ int ddsi_init (struct ddsi_domaingv *gv)
   gv->new_topic_version = 0;
 #ifdef DDS_HAS_TOPIC_DISCOVERY
   ddsrt_mutex_init (&gv->topic_defs_lock);
-  gv->topic_defs = ddsrt_hh_new (1, topic_definition_hash_wrap, topic_definition_equal_wrap);
+  ddsrt_avl_treedef_t topic_defs_treedef = DDSRT_AVL_TREEDEF_INITIALIZER(offsetof(struct ddsi_topic_definition, avlnode), 0, topic_definition_compare, NULL);
+  gv->topic_defs_treedef = topic_defs_treedef;
+  ddsrt_avl_init(&gv->topic_defs_treedef, &gv->topic_defs);
 #endif
   make_special_types (gv);
 
@@ -1640,14 +1668,14 @@ err_unicast_sockets:
   free_special_types (gv);
 #ifndef NDEBUG
   {
-    struct ddsrt_hh_iter it;
-    assert (ddsrt_hh_iter_first (gv->sertypes, &it) == NULL);
+    struct ddsrt_avl_iter it;
+    assert (ddsrt_avl_iter_first (&gv->sertypes_treedef, &gv->sertypes, &it) == NULL);
   }
 #endif
-  ddsrt_hh_free (gv->sertypes);
+  ddsrt_avl_free (&gv->sertypes_treedef, &gv->sertypes, NULL);
   ddsrt_mutex_destroy (&gv->sertypes_lock);
 #ifdef DDS_HAS_TOPIC_DISCOVERY
-  ddsrt_hh_free (gv->topic_defs);
+  ddsrt_avl_free (&gv->topic_defs_treedef, &gv->topic_defs, NULL);
   ddsrt_mutex_destroy (&gv->topic_defs_lock);
 #endif
   ddsrt_mutex_destroy (&gv->new_topic_lock);
@@ -1966,11 +1994,11 @@ void ddsi_fini (struct ddsi_domaingv *gv)
 #ifdef DDS_HAS_TOPIC_DISCOVERY
 #ifndef NDEBUG
   {
-    struct ddsrt_hh_iter it;
-    assert (ddsrt_hh_iter_first (gv->topic_defs, &it) == NULL);
+    struct ddsrt_avl_iter it;
+    assert (ddsrt_avl_iter_first (&gv->topic_defs_treedef, &gv->topic_defs, &it) == NULL);
   }
 #endif
-  ddsrt_hh_free (gv->topic_defs);
+  ddsrt_avl_free (&gv->topic_defs_treedef, &gv->topic_defs, NULL);
   ddsrt_mutex_destroy (&gv->topic_defs_lock);
 #endif /* DDS_HAS_TOPIC_DISCOVERY */
 #ifdef DDS_HAS_TYPE_DISCOVERY
@@ -1988,11 +2016,11 @@ void ddsi_fini (struct ddsi_domaingv *gv)
 #endif /* DDS_HAS_TYPE_DISCOVERY */
 #ifndef NDEBUG
   {
-    struct ddsrt_hh_iter it;
-    assert (ddsrt_hh_iter_first (gv->sertypes, &it) == NULL);
+    struct ddsrt_avl_iter it;
+    assert (ddsrt_avl_iter_first (&gv->sertypes_treedef, &gv->sertypes, &it) == NULL);
   }
 #endif
-  ddsrt_hh_free (gv->sertypes);
+  ddsrt_avl_free (&gv->sertypes_treedef, &gv->sertypes, NULL);
   ddsrt_mutex_destroy (&gv->sertypes_lock);
 #ifdef DDS_HAS_SECURITY
   ddsi_omg_security_free (gv);

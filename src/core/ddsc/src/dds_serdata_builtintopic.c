@@ -477,7 +477,7 @@ static struct ddsi_serdata *ddsi_serdata_builtin_from_sample_topic (const struct
   memset (&templ, 0, sizeof (templ));
   memcpy (&templ.key, &x.key, sizeof (templ.key));
   ddsrt_mutex_lock (&gv->topic_defs_lock);
-  struct ddsi_topic_definition *tpd = ddsrt_hh_lookup (gv->topic_defs, &templ);
+  struct ddsi_topic_definition *tpd = ddsrt_avl_lookup (&gv->topic_defs_treedef, &gv->topic_defs, &templ);
   struct ddsi_serdata *sd = dds_serdata_builtin_from_topic_definition (tpcmn, &x.key, tpd, kind);
   ddsrt_mutex_unlock (&gv->topic_defs_lock);
   return sd;

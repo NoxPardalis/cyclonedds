@@ -36,6 +36,7 @@ DDSI_LIST_TYPES_TMPL(ddsi_type_proxy_guid_list, ddsi_guid_t, NOARG, 32)
 
 struct ddsi_typeid {
   struct DDS_XTypes_TypeIdentifier x;
+  ddsrt_avl_node_t avlnode;
 };
 
 struct ddsi_typeobj {

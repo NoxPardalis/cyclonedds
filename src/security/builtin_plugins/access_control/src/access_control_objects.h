@@ -40,6 +40,7 @@ struct AccessControlObject {
     AccessControlObjectDestructor destructor;
     dds_time_t permissions_expiry;
     dds_security_time_event_handle_t timer;
+    ddsrt_avl_node_t avlnode;
 };
 
 typedef struct local_participant_access_rights {

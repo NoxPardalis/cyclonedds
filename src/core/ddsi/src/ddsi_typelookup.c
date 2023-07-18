@@ -37,6 +37,13 @@
 #include "ddsi__typelib.h"
 #include "dds/cdr/dds_cdrstream.h"
 
+static int deps_typeid_compare(const void *type_id_a, const void *type_id_b)
+{
+  return ddsi_typeid_compare (type_id_a, type_id_b);
+}
+
+static ddsrt_avl_treedef_t DEPS_TREEDEF = DDSRT_AVL_TREEDEF_INITIALIZER(offsetof(struct ddsi_typeid, avlnode), 0, deps_typeid_compare, NULL);
+
 static bool participant_builtin_writers_ready (struct ddsi_participant *pp)
 {
   // lock is needed to read the state, we're fine even if the state flips
@@ -66,7 +73,7 @@ static struct ddsi_writer *get_typelookup_writer (const struct ddsi_domaingv *gv
   return wr;
 }
 
-static int32_t tl_request_get_deps (struct ddsi_domaingv * const gv, struct ddsrt_hh *deps, int32_t cnt, struct ddsi_type *type)
+static int32_t tl_request_get_deps (struct ddsi_domaingv * const gv, ddsrt_avl_treedef_t *deps_treedef, ddsrt_avl_tree_t *deps, int32_t cnt, struct ddsi_type *type)
 {
   struct ddsi_type_dep tmpl, *dep = &tmpl;
   memset (&tmpl, 0, sizeof (tmpl));
@@ -80,36 +87,26 @@ static int32_t tl_request_get_deps (struct ddsi_domaingv * const gv, struct ddsr
     if (!ddsi_type_resolved_locked (gv, dep_type, DDSI_TYPE_IGNORE_DEPS))
     {
       assert (ddsi_typeid_is_hash (&dep_type->xt.id));
-      ddsrt_hh_add (deps, &dep_type->xt.id);
+
+      ddsrt_avl_ipath_t insertion_path;
+      if (ddsrt_avl_lookup_ipath(deps_treedef, deps, &dep_type->xt.id, &insertion_path) == NULL) 
+      {
+        ddsrt_avl_insert_ipath (deps_treedef, deps, &dep_type->xt.id, &insertion_path);
+      }
       cnt++;
       dep_type->state = DDSI_TYPE_REQUESTED;
     }
-    cnt = tl_request_get_deps (gv, deps, cnt, dep_type);
+    cnt = tl_request_get_deps (gv, deps_treedef, deps, cnt, dep_type);
   }
   ddsi_typeid_fini (&tmpl.src_type_id);
   return cnt;
-}
-
-static bool deps_typeid_equal (const void *type_id_a, const void *type_id_b)
-{
-  return ddsi_typeid_compare (type_id_a, type_id_b) == 0;
-}
-
-static uint32_t deps_typeid_hash (const void *type_id)
-{
-  uint32_t hash32;
-  DDS_XTypes_EquivalenceHash hash;
-  assert (ddsi_typeid_is_hash (type_id));
-  ddsi_typeid_get_equivalence_hash (type_id, &hash);
-  memcpy (&hash32, hash, sizeof (hash32));
-  return hash32;
 }
 
 static dds_return_t create_tl_request_msg (struct ddsi_domaingv * const gv, DDS_Builtin_TypeLookup_Request *request, const struct ddsi_writer *wr, const ddsi_guid_t *proxypp_guid, struct ddsi_type *type, ddsi_type_include_deps_t resolve_deps)
 {
   int32_t cnt = 0;
   uint32_t index = 0;
-  struct ddsrt_hh *deps = NULL;
+  ddsrt_avl_tree_t deps;
   memset (request, 0, sizeof (*request));
   memcpy (&request->header.requestId.writer_guid.guidPrefix, &wr->e.guid.prefix, sizeof (request->header.requestId.writer_guid.guidPrefix));
   memcpy (&request->header.requestId.writer_guid.entityId, &wr->e.guid.entityid, sizeof (request->header.requestId.writer_guid.entityId));
@@ -128,8 +125,8 @@ static dds_return_t create_tl_request_msg (struct ddsi_domaingv * const gv, DDS_
     cnt++;
   if (resolve_deps == DDSI_TYPE_INCLUDE_DEPS)
   {
-    deps = ddsrt_hh_new (1, deps_typeid_hash, deps_typeid_equal);
-    cnt += tl_request_get_deps (gv, deps, 0, type);
+    ddsrt_avl_init(&DEPS_TREEDEF, &deps);
+    cnt += tl_request_get_deps (gv, &DEPS_TREEDEF, &deps, 0, type);
   }
   request->data._u.getTypes.type_ids._length = (uint32_t) cnt;
   if (cnt > 0)
@@ -148,15 +145,15 @@ static dds_return_t create_tl_request_msg (struct ddsi_domaingv * const gv, DDS_
 
     if (resolve_deps == DDSI_TYPE_INCLUDE_DEPS)
     {
-      struct ddsrt_hh_iter iter;
-      for (ddsi_typeid_t *tid = ddsrt_hh_iter_first (deps, &iter); tid; tid = ddsrt_hh_iter_next (&iter))
+      struct ddsrt_avl_iter iter;
+      for (ddsi_typeid_t *tid = ddsrt_avl_iter_first (&DEPS_TREEDEF, &deps, &iter); tid; tid = ddsrt_avl_iter_next (&iter))
         ddsi_typeid_copy_impl (&request->data._u.getTypes.type_ids._buffer[index++], &tid->x);
     }
   }
 
 err:
   if (resolve_deps == DDSI_TYPE_INCLUDE_DEPS)
-    ddsrt_hh_free (deps);
+    ddsrt_avl_free (&DEPS_TREEDEF, &deps, NULL);
   return (dds_return_t) cnt;
 }
 

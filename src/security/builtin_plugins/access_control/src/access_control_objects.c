@@ -12,7 +12,7 @@
 #include <string.h>
 #include "dds/ddsrt/atomics.h"
 #include "dds/ddsrt/heap.h"
-#include "dds/ddsrt/hopscotch.h"
+#include "dds/ddsrt/avl.h"
 #include "dds/ddsrt/string.h"
 #include "dds/ddsrt/sync.h"
 #include "dds/ddsrt/types.h"
@@ -22,7 +22,8 @@
 
 struct AccessControlTable
 {
-  struct ddsrt_hh *htab;
+  ddsrt_avl_treedef_t table_treedef;
+  ddsrt_avl_tree_t table;
   ddsrt_mutex_t lock;
 };
 
@@ -38,19 +39,11 @@ bool access_control_object_valid(const AccessControlObject *obj, const AccessCon
   return true;
 }
 
-static uint32_t access_control_object_hash(const void *obj)
-{
-  const AccessControlObject *object = obj;
-  const uint64_t c = 0xE21B371BEB9E6C05;
-  const uint32_t x = (uint32_t)object->handle;
-  return (unsigned)((x * c) >> 32);
-}
-
-static bool access_control_object_equal(const void *ha, const void *hb)
+static int access_control_object_compare(const void *ha, const void *hb)
 {
   const AccessControlObject *la = ha;
   const AccessControlObject *lb = hb;
-  return la->handle == lb->handle;
+  return (la->handle > lb->handle) - (la->handle < lb->handle);
 }
 
 void access_control_object_init(AccessControlObject *obj, AccessControlObjectKind_t kind, AccessControlObjectDestructor destructor)
@@ -97,24 +90,32 @@ struct AccessControlTable *access_control_table_new(void)
   struct AccessControlTable *table;
 
   table = ddsrt_malloc(sizeof(*table));
-  table->htab = ddsrt_hh_new(32, access_control_object_hash, access_control_object_equal);
+  ddsrt_avl_treedef_t treedef =
+    DDSRT_AVL_TREEDEF_INITIALIZER(offsetof(AccessControlObject, avlnode), 0, access_control_object_compare, NULL);
+  table->table_treedef = treedef;
+
+  ddsrt_avl_init(&table->table_treedef, &table->table);
   ddsrt_mutex_init(&table->lock);
   return table;
 }
 
 void access_control_table_free(struct AccessControlTable *table)
 {
-  struct ddsrt_hh_iter it;
+  struct ddsrt_avl_iter it;
   AccessControlObject *obj;
 
   if (!table)
     return;
-  for (obj = ddsrt_hh_iter_first(table->htab, &it); obj; obj = ddsrt_hh_iter_next(&it))
+  for (obj = ddsrt_avl_iter_first(&table->table_treedef, &table->table, &it); obj; obj = ddsrt_avl_iter_next(&it))
   {
-    (void)ddsrt_hh_remove(table->htab, obj);
+    ddsrt_avl_dpath_t deletion_path;
+    if (ddsrt_avl_lookup_dpath(&table->table_treedef, &table->table, obj, &deletion_path) != NULL)
+    {
+      ddsrt_avl_delete_dpath (&table->table_treedef, &table->table, obj, &deletion_path);
+    }
     access_control_object_release(obj);
   }
-  ddsrt_hh_free(table->htab);
+  ddsrt_avl_free(&table->table_treedef, &table->table, NULL);
   ddsrt_mutex_destroy(&table->lock);
   ddsrt_free(table);
 }
@@ -127,10 +128,14 @@ AccessControlObject *access_control_table_insert(struct AccessControlTable *tabl
   assert(object);
   template.handle = object->handle;
   ddsrt_mutex_lock(&table->lock);
-  if (!(cur = access_control_object_keep(ddsrt_hh_lookup(table->htab, &template))))
+  if (!(cur = access_control_object_keep(ddsrt_avl_lookup(&table->table_treedef, &table->table, &template))))
   {
     cur = access_control_object_keep(object);
-    (void)ddsrt_hh_add(table->htab, cur);
+    ddsrt_avl_ipath_t insertion_path;
+    if (ddsrt_avl_lookup_ipath(&table->table_treedef, &table->table, cur, &insertion_path) == NULL)
+    {
+      ddsrt_avl_insert_ipath (&table->table_treedef, &table->table, cur, &insertion_path);
+    }
   }
   ddsrt_mutex_unlock(&table->lock);
   return cur;
@@ -141,7 +146,11 @@ void access_control_table_remove_object(struct AccessControlTable *table, Access
   assert(table);
   assert(object);
   ddsrt_mutex_lock(&table->lock);
-  (void)ddsrt_hh_remove(table->htab, object);
+  ddsrt_avl_dpath_t deletion_path;
+  if (ddsrt_avl_lookup_dpath(&table->table_treedef, &table->table, object, &deletion_path) != NULL)
+  {
+    ddsrt_avl_delete_dpath (&table->table_treedef, &table->table, object, &deletion_path);
+  }
   ddsrt_mutex_unlock(&table->lock);
   access_control_object_release(object);
 }
@@ -153,9 +162,13 @@ AccessControlObject *access_control_table_remove(struct AccessControlTable *tabl
   assert(table);
   template.handle = handle;
   ddsrt_mutex_lock(&table->lock);
-  if ((object = access_control_object_keep(ddsrt_hh_lookup(table->htab, &template))))
+  if ((object = access_control_object_keep(ddsrt_avl_lookup(&table->table_treedef, &table->table, &template))))
   {
-    (void)ddsrt_hh_remove(table->htab, object);
+    ddsrt_avl_dpath_t deletion_path;
+    if (ddsrt_avl_lookup_dpath(&table->table_treedef, &table->table, object, &deletion_path) != NULL)
+    {
+      ddsrt_avl_delete_dpath (&table->table_treedef, &table->table, object, &deletion_path);
+    }
     access_control_object_release(object);
   }
   ddsrt_mutex_unlock(&table->lock);
@@ -169,20 +182,20 @@ AccessControlObject *access_control_table_find(struct AccessControlTable *table,
   assert(table);
   template.handle = handle;
   ddsrt_mutex_lock(&table->lock);
-  object = access_control_object_keep(ddsrt_hh_lookup(table->htab, &template));
+  object = access_control_object_keep(ddsrt_avl_lookup(&table->table_treedef, &table->table, &template));
   ddsrt_mutex_unlock(&table->lock);
   return object;
 }
 
 void access_control_table_walk(struct AccessControlTable *table, AccessControlTableCallback callback, void *arg)
 {
-  struct ddsrt_hh_iter it;
+  struct ddsrt_avl_iter it;
   AccessControlObject *obj;
   int r = 1;
   assert(table);
   assert(callback);
   ddsrt_mutex_lock(&table->lock);
-  for (obj = ddsrt_hh_iter_first(table->htab, &it); r && obj; obj = ddsrt_hh_iter_next(&it))
+  for (obj = ddsrt_avl_iter_first(&table->table_treedef, &table->table, &it); r && obj; obj = ddsrt_avl_iter_next(&it))
     r = callback(obj, arg);
   ddsrt_mutex_unlock(&table->lock);
 }

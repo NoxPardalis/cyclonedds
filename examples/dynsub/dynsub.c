@@ -23,14 +23,15 @@
 
 // TypeObjects can (and often do) refer to other types via an opaque id.  We don't want to have to request
 // the corresponding type object every time we need it (it can be quite costly) and so have cache them in
-// our own hash table.  For the hash table implementation we use one that's part of the implementation of
+// our own AVL tree. For the AVL tree implementation we use one that's part of the implementation of
 // Cyclone DDS.  It is *not* part of the API, it is simply a convenient solution for a simple PoC.
-#include "dds/ddsrt/hopscotch.h"
+#include "dds/ddsrt/avl.h"
 
-// Entry in type cache hash table: it not only caches type objects, it also caches alignment and size of
+// Entry in the type cache AVL tree: it not only caches type objects, it also caches alignment and size of
 // the in-memory representation of any structure types.  These we need to get the alignment calculations
 // correct.
 struct typeinfo {
+  ddsrt_avl_node_t avlnode; // The node positioned in the AVL tree.
   union {
     uintptr_t key; // DDS_XTypes_CompleteTypeObject or DDS_XTypes_TypeIdentifier pointer
     uint32_t u32[sizeof (uintptr_t) / 4];
@@ -41,28 +42,20 @@ struct typeinfo {
   size_t size; // sizeof(T)
 };
 
-// For convenience, the DDS participant and the type cache are globals
-static dds_entity_t participant;
-static struct ddsrt_hh *typecache;
-
-// Hash table requires a hash function and an equality test.  The key in the hash table is the address
-// of the type object or type identifier.  The hash function distinguishes between 32-bit and 64-bit
-// pointers, the equality test can simply use pointer equality.
-static uint32_t typecache_hash (const void *vinfo)
-{
-  const struct typeinfo *info = vinfo;
-  if (sizeof (uintptr_t) == 4)
-    return (uint32_t) (((info->key.u32[0] + UINT64_C (16292676669999574021)) * UINT64_C (10242350189706880077)) >> 32);
-  else
-    return (uint32_t) (((info->key.u32[0] + UINT64_C (16292676669999574021)) * (info->key.u32[1] + UINT64_C (10242350189706880077))) >> 32);
-}
-
-static bool typecache_equal (const void *va, const void *vb)
+// The AVL tree needs a comparison function that gives a total ordering. The key
+// being ordered is either the type object's address or the type identifier's address.
+static int typecache_compare(const void *va, const void *vb)
 {
   const struct typeinfo *a = va;
   const struct typeinfo *b = vb;
-  return a->key.key == b->key.key;
+  return (a->key.key > b->key.key) - (a->key.key < b->key.key);
 }
+
+// For convenience, the DDS participant and the type cache are globals
+static dds_entity_t participant;
+static ddsrt_avl_treedef_t typecache_treedef = DDSRT_AVL_TREEDEF_INITIALIZER(offsetof(struct typeinfo, avlnode), 0, typecache_compare, NULL);
+static ddsrt_avl_tree_t typecache;
+
 
 // Building the type cache: the TypeObjects come in a variety of formats (see the spec for the details,
 // much is omitted here for simplicity), but it comes down to:
@@ -120,7 +113,7 @@ static void build_typecache_ti (const DDS_XTypes_TypeIdentifier *typeid, size_t 
     }
     case DDS_XTypes_EK_COMPLETE: {
       struct typeinfo templ = { .key = { .key = (uintptr_t) typeid } }, *info;
-      if ((info = ddsrt_hh_lookup (typecache, &templ)) != NULL) {
+      if ((info = ddsrt_avl_lookup (&typecache_treedef, &typecache, &templ)) != NULL) {
         *align = info->align;
         *size = info->size;
       } else {
@@ -131,7 +124,7 @@ static void build_typecache_ti (const DDS_XTypes_TypeIdentifier *typeid, size_t 
         build_typecache_to (&xtypeobj->_u.complete, align, size);
         info = malloc (sizeof (*info));
         *info = (struct typeinfo){ .key = { .key = (uintptr_t) typeid }, .typeobj = &xtypeobj->_u.complete, .release = xtypeobj, .align = *align, .size = *size };
-        ddsrt_hh_add (typecache, info);
+        ddsrt_avl_insert (&typecache_treedef, &typecache, info);
       }
       break;
     }
@@ -156,7 +149,7 @@ static void build_typecache_to (const DDS_XTypes_CompleteTypeObject *typeobj, si
     }
     case DDS_XTypes_TK_STRUCTURE: {
       struct typeinfo templ = { .key = { .key = (uintptr_t) typeobj } }, *info;
-      if ((info = ddsrt_hh_lookup (typecache, &templ)) != NULL) {
+      if ((info = ddsrt_avl_lookup (&typecache_treedef, &typecache, &templ)) != NULL) {
         *align = info->align;
         *size = info->size;
       } else {
@@ -177,7 +170,7 @@ static void build_typecache_to (const DDS_XTypes_CompleteTypeObject *typeobj, si
           *size += *align - (*size % *align);
         info = malloc (sizeof (*info));
         *info = (struct typeinfo){ .key = { .key = (uintptr_t) typeobj }, .typeobj = typeobj, .release = NULL, .align = *align, .size = *size };
-        ddsrt_hh_add (typecache, info);
+        ddsrt_avl_insert (&typecache_treedef, &typecache, info);
       }
       break;
     }
@@ -290,7 +283,7 @@ static void print_sample1_ti (const unsigned char *sample, const DDS_XTypes_Type
       break;
     }
     case DDS_XTypes_EK_COMPLETE: {
-      struct typeinfo templ = { .key = { .key = (uintptr_t) typeid } }, *info = ddsrt_hh_lookup (typecache, &templ);
+      struct typeinfo templ = { .key = { .key = (uintptr_t) typeid } }, *info = ddsrt_avl_lookup (&typecache_treedef, &typecache, &templ);
       print_sample1_to (sample, info->typeobj, c, sep, label);
       break;
     }
@@ -322,7 +315,7 @@ static void print_sample1_to (const unsigned char *sample, const DDS_XTypes_Comp
       break;
     }
     case DDS_XTypes_TK_STRUCTURE: {
-      struct typeinfo templ = { .key = { .key = (uintptr_t) typeobj } }, *info = ddsrt_hh_lookup (typecache, &templ);
+      struct typeinfo templ = { .key = { .key = (uintptr_t) typeobj } }, *info = ddsrt_avl_lookup (&typecache_treedef, &typecache, &templ);
       const DDS_XTypes_CompleteStructType *t = &typeobj->_u.struct_type;
       const unsigned char *p = align (sample, c, info->align, info->size);;
       printf ("%s", sep);
@@ -422,7 +415,7 @@ static dds_return_t get_topic_and_typeobj (const char *topic_name, dds_duration_
     size_t align, size;
     build_typecache_to (&(*xtypeobj)->_u.complete, &align, &size);
     struct typeinfo templ = { .key = { .key = (uintptr_t) *xtypeobj } } , *info;
-    if ((info = ddsrt_hh_lookup (typecache, &templ)) != NULL)
+    if ((info = ddsrt_avl_lookup (&typecache_treedef, &typecache, &templ)) != NULL)
     {
       assert (info->release == NULL);
       info->release = *xtypeobj;
@@ -432,7 +425,7 @@ static dds_return_t get_topic_and_typeobj (const char *topic_name, dds_duration_
       // not sure whether this is at all possible
       info = malloc (sizeof (*info));
       *info = (struct typeinfo){ .key = { .key = (uintptr_t) *xtypeobj }, .typeobj = &(*xtypeobj)->_u.complete, .release = *xtypeobj, .align = align, .size = size };
-      ddsrt_hh_add (typecache, info);
+      ddsrt_avl_insert (&typecache_treedef, &typecache, info);
     }
   }
 error:
@@ -453,6 +446,8 @@ int main (int argc, char **argv)
   }
 
   participant = dds_create_participant (DDS_DOMAIN_DEFAULT, NULL, NULL);
+  dds_delete(participant);
+  return 0;
   if (participant < 0)
   {
     fprintf (stderr, "dds_create_participant: %s\n", dds_strretcode (participant));
@@ -461,7 +456,7 @@ int main (int argc, char **argv)
   
   // The one magic step: get a topic and type object ...
   DDS_XTypes_TypeObject *xtypeobj;
-  typecache = ddsrt_hh_new (1, typecache_hash, typecache_equal);
+  ddsrt_avl_init (&typecache_treedef, &typecache);
   if ((ret = get_topic_and_typeobj (argv[1], DDS_SECS (10), &topic, &xtypeobj)) < 0)
   {
     fprintf (stderr, "get_topic_and_typeobj: %s\n", dds_strretcode (ret));
@@ -490,8 +485,8 @@ int main (int argc, char **argv)
   }
 
  error:
-  ddsrt_hh_enum (typecache, free_typeinfo, NULL);
-  ddsrt_hh_free (typecache);
+  ddsrt_avl_walk (&typecache_treedef, &typecache, free_typeinfo, NULL);
+  ddsrt_avl_free (&typecache_treedef, &typecache, NULL);
   dds_delete (participant);
   return ret < 0;
 }

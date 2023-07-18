@@ -757,7 +757,7 @@ static dds_entity_t find_local_topic_pp (dds_participant *pp, const char *name, 
     {
       struct ddsi_domaingv * const gv = &pp_topic->m_entity.m_domain->gv;
       ddsrt_mutex_lock (&gv->sertypes_lock);
-      assert (ddsrt_hh_lookup (gv->sertypes, sertype) == sertype);
+      assert (ddsrt_avl_lookup (&gv->sertypes_treedef, &gv->sertypes, sertype) == sertype);
       ddsrt_mutex_unlock (&gv->sertypes_lock);
       const uint32_t sertype_flags_refc = ddsrt_atomic_ld32 (&sertype->flags_refc);
       assert (sertype_flags_refc & DDSI_SERTYPE_REGISTERED);

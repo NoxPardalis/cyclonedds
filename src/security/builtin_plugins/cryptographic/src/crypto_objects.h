@@ -67,6 +67,7 @@ struct CryptoObject
   ddsrt_atomic_uint32_t refcount;
   CryptoObjectKind_t kind;
   CryptoObjectDestructor destructor;
+  ddsrt_avl_node_t avlnode;
 };
 
 struct local_datawriter_crypto;
@@ -383,7 +384,8 @@ typedef int (*CryptoObjectTableCallback)(CryptoObject *obj, void *arg);
 
 struct CryptoObjectTable
 {
-  struct ddsrt_hh *htab;
+  ddsrt_avl_treedef_t htab_treedef;
+  ddsrt_avl_tree_t htab;
   ddsrt_mutex_t lock;
   CryptoObjectFindFunction findfnc;
 };

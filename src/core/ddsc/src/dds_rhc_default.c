@@ -251,6 +251,7 @@ struct rhc_sample {
 };
 
 struct rhc_instance {
+  ddsrt_avl_node_t avlnode;
   uint64_t iid;                /* unique instance id, key of table, also serves as instance handle */
   uint64_t wr_iid;             /* unique of id of writer of latest sample or 0; if wrcount = 0 it is the wr_iid that caused  */
   struct rhc_sample *latest;   /* latest received sample; circular list old->new; null if no sample */
@@ -287,7 +288,7 @@ typedef enum rhc_store_result {
 
 struct dds_rhc_default {
   struct dds_rhc common;
-  struct ddsrt_hh *instances;
+  ddsrt_avl_tree_t instances;
   struct ddsrt_circlist nonempty_instances; /* circular, points to most recently added one, NULL if none */
   struct lwregs registrations;       /* should be a global one (with lock-free lookups) */
 
@@ -419,17 +420,11 @@ static void account_for_nonempty_to_empty_transition (struct dds_rhc_default * _
 static bool rhc_check_counts_locked (struct dds_rhc_default *rhc, bool check_conds, bool check_qcmask);
 #endif
 
-static uint32_t instance_iid_hash (const void *va)
-{
-  const struct rhc_instance *a = va;
-  return (uint32_t) a->iid;
-}
-
-static bool instance_iid_eq (const void *va, const void *vb)
+static int instance_iid_compare(const void *va, const void *vb) 
 {
   const struct rhc_instance *a = va;
   const struct rhc_instance *b = vb;
-  return (a->iid == b->iid);
+  return (a->iid > b->iid) - (a->iid < b->iid);
 }
 
 static void add_inst_to_nonempty_list (struct dds_rhc_default *rhc, struct rhc_instance *inst)
@@ -560,6 +555,8 @@ ddsrt_mtime_t dds_rhc_default_deadline_missed_cb(void *hc, ddsrt_mtime_t tnow)
 }
 #endif /* DDS_HAS_DEADLINE_MISSED */
 
+static ddsrt_avl_treedef_t INSTANCE_TREEDEF = DDSRT_AVL_TREEDEF_INITIALIZER(offsetof(struct rhc_instance, avlnode), 0, instance_iid_compare, NULL);
+
 struct dds_rhc *dds_rhc_default_new_xchecks (dds_reader *reader, struct ddsi_domaingv *gv, const struct ddsi_sertype *type, bool xchecks)
 {
   struct dds_rhc_default *rhc = ddsrt_malloc (sizeof (*rhc));
@@ -568,7 +565,7 @@ struct dds_rhc *dds_rhc_default_new_xchecks (dds_reader *reader, struct ddsi_dom
 
   lwregs_init (&rhc->registrations);
   ddsrt_mutex_init (&rhc->lock);
-  rhc->instances = ddsrt_hh_new (1, instance_iid_hash, instance_iid_eq);
+  ddsrt_avl_init(&INSTANCE_TREEDEF, &rhc->instances);
   ddsrt_circlist_init (&rhc->nonempty_instances);
   rhc->type = type;
   rhc->reader = reader;
@@ -782,12 +779,12 @@ static void dds_rhc_default_free (struct ddsi_rhc *rhc_common)
 #ifdef DDS_HAS_DEADLINE_MISSED
   ddsi_deadline_stop (&rhc->deadline);
 #endif
-  ddsrt_hh_enum (rhc->instances, free_instance_rhc_free_wrap, rhc);
+  ddsrt_avl_walk(&INSTANCE_TREEDEF, &rhc->instances, free_instance_rhc_free_wrap, rhc);
   assert (ddsrt_circlist_isempty (&rhc->nonempty_instances));
 #ifdef DDS_HAS_DEADLINE_MISSED
   ddsi_deadline_fini (&rhc->deadline);
 #endif
-  ddsrt_hh_free (rhc->instances);
+  ddsrt_avl_free(&INSTANCE_TREEDEF, &rhc->instances, NULL);
   lwregs_fini (&rhc->registrations);
   if (rhc->qcond_eval_samplebuf != NULL)
     ddsi_sertype_free_sample (rhc->type, rhc->qcond_eval_samplebuf, DDS_FREE_ALL);
@@ -1096,7 +1093,7 @@ static void drop_instance_noupdate_no_writers (struct dds_rhc_default *__restric
   if (inst->isnew)
     rhc->n_new--;
 
-  ddsrt_hh_remove_present (rhc->instances, inst);
+  ddsrt_avl_delete(&INSTANCE_TREEDEF, &rhc->instances, inst);
   free_empty_instance (inst, rhc);
   *instptr = NULL;
 }
@@ -1429,7 +1426,6 @@ static struct rhc_instance *alloc_new_instance (struct dds_rhc_default *rhc, con
 static rhc_store_result_t rhc_store_new_instance (struct rhc_instance **out_inst, struct dds_rhc_default *rhc, const struct ddsi_writer_info *wrinfo, struct ddsi_serdata *sample, struct ddsi_tkmap_instance *tk, const bool has_data, ddsi_status_cb_data_t *cb_data, struct trigger_info_qcond *trig_qc, bool * __restrict nda)
 {
   struct rhc_instance *inst;
-  int ret;
 
   /* New instance for this reader.  May still filter out key value.
 
@@ -1477,9 +1473,11 @@ static rhc_store_result_t rhc_store_new_instance (struct rhc_instance **out_inst
   }
 
   account_for_empty_to_nonempty_transition (rhc, inst);
-  ret = ddsrt_hh_add (rhc->instances, inst);
-  assert (ret);
-  (void) ret;
+
+  ddsrt_avl_ipath_t insertion_path;
+  if (ddsrt_avl_lookup_ipath(&INSTANCE_TREEDEF, &rhc->instances, inst, &insertion_path) == NULL) {
+     ddsrt_avl_insert_ipath (&INSTANCE_TREEDEF, &rhc->instances, inst, &insertion_path);
+  }
   rhc->n_instances++;
   rhc->n_new++;
 
@@ -1602,7 +1600,7 @@ static bool dds_rhc_default_store (struct ddsi_rhc * __restrict rhc_common, cons
 
   ddsrt_mutex_lock (&rhc->lock);
 
-  inst = ddsrt_hh_lookup (rhc->instances, &dummy_instance);
+  inst = ddsrt_avl_lookup (&INSTANCE_TREEDEF, &rhc->instances, &dummy_instance);
   if (inst == NULL)
   {
     /* New instance for this reader.  If no data content -- not (also)
@@ -1788,12 +1786,12 @@ static void dds_rhc_default_unregister_wr (struct ddsi_rhc * __restrict rhc_comm
   struct dds_rhc_default * __restrict const rhc = (struct dds_rhc_default * __restrict) rhc_common;
   bool notify_data_available = false;
   struct rhc_instance *inst;
-  struct ddsrt_hh_iter iter;
+  struct ddsrt_avl_iter iter;
   const uint64_t wr_iid = wrinfo->iid;
 
   ddsrt_mutex_lock (&rhc->lock);
   TRACE ("rhc_unregister_wr_iid %"PRIx64",%d:\n", wr_iid, wrinfo->auto_dispose);
-  for (inst = ddsrt_hh_iter_first (rhc->instances, &iter); inst; inst = ddsrt_hh_iter_next (&iter))
+  for (inst = ddsrt_avl_iter_first (&INSTANCE_TREEDEF, &rhc->instances, &iter); inst; inst = ddsrt_avl_iter_next (&iter))
   {
     if ((inst->wr_iid_islive && inst->wr_iid == wr_iid) || lwregs_contains (&rhc->registrations, inst->iid, wr_iid))
     {
@@ -1819,10 +1817,10 @@ static void dds_rhc_default_relinquish_ownership (struct ddsi_rhc * __restrict r
 {
   struct dds_rhc_default * __restrict const rhc = (struct dds_rhc_default * __restrict) rhc_common;
   struct rhc_instance *inst;
-  struct ddsrt_hh_iter iter;
+  struct ddsrt_avl_iter iter;
   ddsrt_mutex_lock (&rhc->lock);
   TRACE ("rhc_relinquish_ownership(%"PRIx64":\n", wr_iid);
-  for (inst = ddsrt_hh_iter_first (rhc->instances, &iter); inst; inst = ddsrt_hh_iter_next (&iter))
+  for (inst = ddsrt_avl_iter_first (&INSTANCE_TREEDEF, &rhc->instances, &iter); inst; inst = ddsrt_avl_iter_next (&iter))
   {
     if (inst->wr_iid_islive && inst->wr_iid == wr_iid)
     {
@@ -2224,7 +2222,7 @@ static int32_t read_w_qminv (struct dds_rhc_default * __restrict rhc, bool lock,
   {
     struct rhc_instance template, *inst;
     template.iid = handle;
-    if ((inst = ddsrt_hh_lookup (rhc->instances, &template)) != NULL)
+    if ((inst = ddsrt_avl_lookup (&INSTANCE_TREEDEF, &rhc->instances, &template)) != NULL)
       n = read_w_qminv_inst (rhc, inst, values, info_seq, max_samples, qminv, qcmask, to_sample, to_invsample);
     else
       n = DDS_RETCODE_PRECONDITION_NOT_MET;
@@ -2269,7 +2267,7 @@ static int32_t take_w_qminv (struct dds_rhc_default * __restrict rhc, bool lock,
   {
     struct rhc_instance template, *inst;
     template.iid = handle;
-    if ((inst = ddsrt_hh_lookup (rhc->instances, &template)) != NULL)
+    if ((inst = ddsrt_avl_lookup (&INSTANCE_TREEDEF, &rhc->instances, &template)) != NULL)
       n = take_w_qminv_inst (rhc, &inst, values, info_seq, max_samples, qminv, qcmask, to_sample, to_invsample);
     else
       n = DDS_RETCODE_PRECONDITION_NOT_MET;
@@ -2372,7 +2370,7 @@ static bool dds_rhc_default_add_readcondition (struct dds_rhc *rhc_common, dds_r
      readconditions on a reader in one set, without distinguishing
      between those attached to a waitset or not. */
   struct dds_rhc_default * const rhc = (struct dds_rhc_default *) rhc_common;
-  struct ddsrt_hh_iter it;
+  struct ddsrt_avl_iter it;
 
   assert ((dds_entity_kind (&cond->m_entity) == DDS_KIND_COND_READ && cond->m_query.m_filter == 0) ||
           (dds_entity_kind (&cond->m_entity) == DDS_KIND_COND_QUERY && cond->m_query.m_filter != 0));
@@ -2435,7 +2433,7 @@ static bool dds_rhc_default_add_readcondition (struct dds_rhc *rhc_common, dds_r
     /* Attaching a query condition means clearing the allocated bit in all instances and
        samples, except for those that match the predicate. */
     const dds_querycond_mask_t qcmask = cond->m_query.m_qcmask;
-    for (struct rhc_instance *inst = ddsrt_hh_iter_first (rhc->instances, &it); inst != NULL; inst = ddsrt_hh_iter_next (&it))
+    for (struct rhc_instance *inst = ddsrt_avl_iter_first (&INSTANCE_TREEDEF, &rhc->instances, &it); inst != NULL; inst = ddsrt_avl_iter_next (&it))
     {
       const bool instmatch = eval_predicate_invsample (rhc, inst, cond->m_query.m_filter);;
       uint32_t matches = 0;
@@ -2750,7 +2748,7 @@ static bool rhc_check_counts_locked (struct dds_rhc_default *rhc, bool check_con
   uint32_t cond_match_count[CHECK_MAX_CONDS];
   dds_querycond_mask_t enabled_qcmask = 0;
   struct rhc_instance *inst;
-  struct ddsrt_hh_iter iter;
+  struct ddsrt_avl_iter iter;
   dds_readcond *rciter;
   uint32_t i;
 
@@ -2766,7 +2764,7 @@ static bool rhc_check_counts_locked (struct dds_rhc_default *rhc, bool check_con
     enabled_qcmask |= rciter->m_query.m_qcmask;
   }
 
-  for (inst = ddsrt_hh_iter_first (rhc->instances, &iter); inst; inst = ddsrt_hh_iter_next (&iter))
+  for (inst = ddsrt_avl_iter_first (&INSTANCE_TREEDEF, &rhc->instances, &iter); inst; inst = ddsrt_avl_iter_next (&iter))
   {
     uint32_t n_vsamples_in_instance = 0, n_read_vsamples_in_instance = 0;
     bool a_sample_free = true;

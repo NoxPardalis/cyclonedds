@@ -15,6 +15,7 @@
 #include "dds/ddsrt/retcode.h"
 #include "dds/ddsrt/atomics.h"
 #include "dds/dds.h"
+#include "dds/ddsrt/avl.h"
 
 #if defined (__cplusplus)
 extern "C" {
@@ -71,6 +72,7 @@ typedef int32_t dds_handle_t;
 #define HDL_FLAG_NO_USER_ACCESS  (0x04000000u)
 
 struct dds_handle_link {
+  ddsrt_avl_node_t avlnode;
   dds_handle_t hdl;
   ddsrt_atomic_uint32_t cnt_flags;
 };

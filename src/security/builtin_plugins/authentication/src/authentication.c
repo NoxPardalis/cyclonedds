@@ -16,7 +16,7 @@
 #include "dds/ddsrt/atomics.h"
 #include "dds/ddsrt/string.h"
 #include "dds/ddsrt/sync.h"
-#include "dds/ddsrt/hopscotch.h"
+#include "dds/ddsrt/avl.h"
 #include "dds/ddsrt/static_assert.h"
 #include "dds/ddsi/ddsi_domaingv.h"
 #include "dds/security/dds_security_api.h"
@@ -69,6 +69,7 @@ struct SecurityObject
   int64_t handle;
   SecurityObjectKind_t kind;
   SecurityObjectDestructor destructor;
+  ddsrt_avl_node_t avlnode;
 };
 
 #ifndef NDEBUG
@@ -111,8 +112,10 @@ typedef struct RemoteIdentityInfo
   DDS_Security_IdentityToken *remoteIdentityToken;
   DDS_Security_OctetSeq pdata;
   char *permissionsDocument;
-  struct ddsrt_hh *linkHash; /* contains the IdentityRelation objects */
+  ddsrt_avl_treedef_t linkHashTreedef;
+  ddsrt_avl_tree_t linkHash; /* contains the IdentityRelation objects */
   dds_security_time_event_handle_t timer;
+  ddsrt_avl_node_t avlnode;
 } RemoteIdentityInfo;
 
 /* This structure contains the relation between a local and a remote identity
@@ -127,6 +130,7 @@ typedef struct IdentityRelation
   RemoteIdentityInfo *remoteIdentity;
   AuthenticationChallenge *lchallenge;
   AuthenticationChallenge *rchallenge;
+  ddsrt_avl_node_t avlnode;
 } IdentityRelation;
 
 typedef struct HandshakeInfo
@@ -145,8 +149,10 @@ typedef struct dds_security_authentication_impl
 {
   dds_security_authentication base;
   ddsrt_mutex_t lock;
-  struct ddsrt_hh *objectHash;
-  struct ddsrt_hh *remoteGuidHash;
+  ddsrt_avl_treedef_t objectHashTreedef;
+  ddsrt_avl_tree_t objectHash;
+  ddsrt_avl_treedef_t remoteGuidHashTreedef;
+  ddsrt_avl_tree_t remoteGuidHash;
   struct dds_security_timed_dispatcher *dispatcher;
   const dds_security_authentication_listener *listener;
   X509Seq trustedCAList;
@@ -175,26 +181,18 @@ static bool security_object_valid(SecurityObject *obj, SecurityObjectKind_t kind
   return true;
 }
 
-static uint32_t security_object_hash(const void *obj)
-{
-  const SecurityObject *object = obj;
-  const uint64_t c = UINT64_C (16292676669999574021);
-  const uint32_t x = (uint32_t)object->handle;
-  return (uint32_t)((x * c) >> 32);
-}
-
-static bool security_object_equal(const void *ha, const void *hb)
+static int security_object_compare(const void *ha, const void *hb)
 {
   const SecurityObject *la = ha;
   const SecurityObject *lb = hb;
-  return la->handle == lb->handle;
+  return (la->handle > lb->handle) - (la->handle < lb->handle);
 }
 
-static SecurityObject *security_object_find(const struct ddsrt_hh *hh, int64_t handle)
+static SecurityObject *security_object_find(const ddsrt_avl_treedef_t *hh_treedef, const ddsrt_avl_tree_t *hh, int64_t handle)
 {
   struct SecurityObject template;
   template.handle = handle;
-  return (SecurityObject *)ddsrt_hh_lookup(hh, &template);
+  return (SecurityObject *)ddsrt_avl_lookup(hh_treedef, hh, &template);
 }
 
 static void security_object_init(SecurityObject *obj, SecurityObjectKind_t kind, SecurityObjectDestructor destructor)
@@ -271,26 +269,18 @@ static LocalIdentityInfo *local_identity_info_new(DDS_Security_DomainId domainId
   return identity;
 }
 
-static uint32_t remote_guid_hash(const void *obj)
-{
-  const RemoteIdentityInfo *identity = obj;
-  uint32_t tmp[4];
-  memcpy(tmp, &identity->guid, sizeof(tmp));
-  return (tmp[0] ^ tmp[1] ^ tmp[2] ^ tmp[3]);
-}
-
-static bool remote_guid_equal(const void *ha, const void *hb)
+static int remote_guid_compare(const void *ha, const void *hb)
 {
   const RemoteIdentityInfo *la = ha;
   const RemoteIdentityInfo *lb = hb;
-  return memcmp(&la->guid, &lb->guid, sizeof(la->guid)) == 0;
+  return memcmp(&la->guid, &lb->guid, sizeof(la->guid));
 }
 
-static RemoteIdentityInfo *find_remote_identity_by_guid(const struct ddsrt_hh *hh, const DDS_Security_GUID_t *guid)
+static RemoteIdentityInfo *find_remote_identity_by_guid(const ddsrt_avl_treedef_t *hh_treedef, const ddsrt_avl_tree_t *hh, const DDS_Security_GUID_t *guid)
 {
   struct RemoteIdentityInfo template;
   memcpy(&template.guid, guid, sizeof(*guid));
-  return (RemoteIdentityInfo *)ddsrt_hh_lookup(hh, &template);
+  return (RemoteIdentityInfo *)ddsrt_avl_lookup(hh_treedef, hh, &template);
 }
 
 static void remote_identity_info_free(SecurityObject *obj)
@@ -302,7 +292,7 @@ static void remote_identity_info_free(SecurityObject *obj)
     if (identity->identityCert)
       X509_free(identity->identityCert);
     DDS_Security_DataHolder_free(identity->remoteIdentityToken);
-    ddsrt_hh_free(identity->linkHash);
+    ddsrt_avl_free(&identity->linkHashTreedef, &identity->linkHash, NULL);
     ddsrt_free(identity->pdata._buffer);
     ddsrt_free(identity->permissionsDocument);
     security_object_deinit((SecurityObject *)identity);
@@ -325,7 +315,11 @@ static RemoteIdentityInfo *remote_identity_info_new(const DDS_Security_GUID_t *g
   identity->dsignAlgoKind = AUTH_ALGO_KIND_UNKNOWN;
   identity->kagreeAlgoKind = AUTH_ALGO_KIND_UNKNOWN;
   identity->permissionsDocument = ddsrt_strdup("");
-  identity->linkHash = ddsrt_hh_new(32, security_object_hash, security_object_equal);
+
+  ddsrt_avl_treedef_t treedef = DDSRT_AVL_TREEDEF_INITIALIZER(offsetof(IdentityRelation, avlnode), 0, security_object_compare, NULL);
+  identity->linkHashTreedef = treedef;
+  ddsrt_avl_init(&identity->linkHashTreedef, &identity->linkHash);
+
   return identity;
 }
 
@@ -402,20 +396,24 @@ static HandshakeInfo *handshake_info_new(LocalIdentityInfo *localIdentity, Remot
 
 static IdentityRelation *find_identity_relation(const RemoteIdentityInfo *remote, int64_t lid)
 {
-  return (IdentityRelation *)security_object_find(remote->linkHash, lid);
+  return (IdentityRelation *)security_object_find(&remote->linkHashTreedef, &remote->linkHash, lid);
 }
 
 static void remove_identity_relation(RemoteIdentityInfo *remote, IdentityRelation *relation)
 {
-  (void)ddsrt_hh_remove(remote->linkHash, relation);
+  ddsrt_avl_dpath_t deletion_path;
+  if (ddsrt_avl_lookup_dpath(&remote->linkHashTreedef, &remote->linkHash, relation, &deletion_path) != NULL)
+  {
+    ddsrt_avl_delete_dpath (&remote->linkHashTreedef, &remote->linkHash, relation, &deletion_path);
+  }
   security_object_free((SecurityObject *)relation);
 }
 
 static HandshakeInfo *find_handshake(const dds_security_authentication_impl *auth, int64_t localId, int64_t remoteId)
 {
-  struct ddsrt_hh_iter it;
+  struct ddsrt_avl_iter it;
   SecurityObject *obj;
-  for (obj = ddsrt_hh_iter_first(auth->objectHash, &it); obj; obj = ddsrt_hh_iter_next(&it))
+  for (obj = ddsrt_avl_iter_first(&auth->objectHashTreedef, &auth->objectHash, &it); obj; obj = ddsrt_avl_iter_next(&it))
   {
     if (obj->kind == SECURITY_OBJECT_KIND_HANDSHAKE)
     {
@@ -579,7 +577,7 @@ static SecurityObject *get_identity_info(dds_security_authentication_impl *auth,
   SecurityObject *obj;
 
   ddsrt_mutex_lock(&auth->lock);
-  if ((obj = security_object_find(auth->objectHash, handle)) != NULL)
+  if ((obj = security_object_find(&auth->objectHashTreedef, &auth->objectHash, handle)) != NULL)
   {
     if ((obj->kind != SECURITY_OBJECT_KIND_LOCAL_IDENTITY) && (obj->kind != SECURITY_OBJECT_KIND_REMOTE_IDENTITY))
       obj = NULL;
@@ -772,7 +770,11 @@ DDS_Security_ValidationResult_t validate_local_identity(dds_security_authenticat
     identity->timer = add_validity_end_trigger(implementation, *local_identity_handle, certExpiry);
 
   ddsrt_mutex_lock(&implementation->lock);
-  (void)ddsrt_hh_add(implementation->objectHash, identity);
+  ddsrt_avl_ipath_t insertion_path;
+  if (ddsrt_avl_lookup_ipath(&implementation->objectHashTreedef, &implementation->objectHash, identity, &insertion_path) == NULL)
+  {
+    ddsrt_avl_insert_ipath (&implementation->objectHashTreedef, &implementation->objectHash, identity, &insertion_path);
+  }
   ddsrt_mutex_unlock(&implementation->lock);
   return DDS_SECURITY_VALIDATION_OK;
 
@@ -819,7 +821,7 @@ DDS_Security_boolean get_identity_token(dds_security_authentication *instance, D
 
   ddsrt_mutex_lock(&impl->lock);
 
-  obj = security_object_find(impl->objectHash, handle);
+  obj = security_object_find(&impl->objectHashTreedef, &impl->objectHash, handle);
   if (!obj || !security_object_valid(obj, SECURITY_OBJECT_KIND_LOCAL_IDENTITY))
   {
     DDS_Security_Exception_set(ex, DDS_AUTH_PLUGIN_CONTEXT, DDS_SECURITY_ERR_UNDEFINED_CODE, DDS_SECURITY_VALIDATION_FAILED, "get_identity_token: Invalid handle provided");
@@ -887,7 +889,7 @@ DDS_Security_boolean set_permissions_credential_and_token(dds_security_authentic
   LocalIdentityInfo *identity;
 
   ddsrt_mutex_lock(&impl->lock);
-  identity = (LocalIdentityInfo *)security_object_find(impl->objectHash, handle);
+  identity = (LocalIdentityInfo *)security_object_find(&impl->objectHashTreedef, &impl->objectHash, handle);
   if (!identity || !SECURITY_OBJECT_VALID(identity, SECURITY_OBJECT_KIND_LOCAL_IDENTITY))
   {
     ddsrt_mutex_unlock(&impl->lock);
@@ -1019,7 +1021,7 @@ DDS_Security_ValidationResult_t validate_remote_identity(dds_security_authentica
   AuthenticationChallenge *lchallenge = NULL, *rchallenge = NULL;
 
   ddsrt_mutex_lock(&impl->lock);
-  obj = security_object_find(impl->objectHash, local_identity_handle);
+  obj = security_object_find(&impl->objectHashTreedef, &impl->objectHash, local_identity_handle);
   if (!obj || !security_object_valid(obj, SECURITY_OBJECT_KIND_LOCAL_IDENTITY))
   {
     DDS_Security_Exception_set(ex, DDS_AUTH_PLUGIN_CONTEXT, DDS_SECURITY_ERR_UNDEFINED_CODE, DDS_SECURITY_VALIDATION_FAILED, "validate_remote_identity: Invalid handle provided");
@@ -1044,13 +1046,23 @@ DDS_Security_ValidationResult_t validate_remote_identity(dds_security_authentica
      a local an remote identity. This handshake structure is inserted in the remote identity structure. */
 
   /* Check if the remote identity has already been validated by a previous validation request. */
-  if (!(remoteIdent = find_remote_identity_by_guid(impl->remoteGuidHash, remote_participant_guid)))
+  if (!(remoteIdent = find_remote_identity_by_guid(&impl->remoteGuidHashTreedef, &impl->remoteGuidHash, remote_participant_guid)))
   {
     remoteIdent = remote_identity_info_new(remote_participant_guid, remote_identity_token);
-    (void)ddsrt_hh_add(impl->objectHash, remoteIdent);
-    (void)ddsrt_hh_add(impl->remoteGuidHash, remoteIdent);
+    ddsrt_avl_ipath_t insertion_path;
+    if (ddsrt_avl_lookup_ipath(&impl->objectHashTreedef, &impl->objectHash, remoteIdent, &insertion_path) == NULL)
+    {
+      ddsrt_avl_insert_ipath (&impl->objectHashTreedef, &impl->objectHash, remoteIdent, &insertion_path);
+    }
+    if (ddsrt_avl_lookup_ipath(&impl->remoteGuidHashTreedef, &impl->remoteGuidHash, remoteIdent, &insertion_path) == NULL)
+    {
+      ddsrt_avl_insert_ipath (&impl->remoteGuidHashTreedef, &impl->remoteGuidHash, remoteIdent, &insertion_path);
+    }
     relation = identity_relation_new(localIdent, remoteIdent, lchallenge, rchallenge);
-    (void)ddsrt_hh_add(remoteIdent->linkHash, relation);
+    if (ddsrt_avl_lookup_ipath(&remoteIdent->linkHashTreedef, &remoteIdent->linkHash, relation, &insertion_path) == NULL)
+    {
+      ddsrt_avl_insert_ipath (&remoteIdent->linkHashTreedef, &remoteIdent->linkHash, relation, &insertion_path);
+    }
   }
   else
   {
@@ -1064,9 +1076,13 @@ DDS_Security_ValidationResult_t validate_remote_identity(dds_security_authentica
     if (!(relation = find_identity_relation(remoteIdent, SECURITY_OBJECT_HANDLE(localIdent))))
     {
       relation = identity_relation_new(localIdent, remoteIdent, lchallenge, rchallenge);
-      int r = ddsrt_hh_add(remoteIdent->linkHash, relation);
-      assert(r);
-      (void)r;
+
+      ddsrt_avl_ipath_t insertion_path;
+      if (ddsrt_avl_lookup_ipath(&remoteIdent->linkHashTreedef, &remoteIdent->linkHash, relation, &insertion_path) == NULL)
+      {
+        ddsrt_avl_insert_ipath (&remoteIdent->linkHashTreedef, &remoteIdent->linkHash, relation, &insertion_path);
+        assert(true);
+      }
     }
     else
     {
@@ -1125,7 +1141,7 @@ DDS_Security_ValidationResult_t begin_handshake_request(dds_security_authenticat
 
   ddsrt_mutex_lock(&impl->lock);
 
-  obj = security_object_find(impl->objectHash, initiator_identity_handle);
+  obj = security_object_find(&impl->objectHashTreedef, &impl->objectHash, initiator_identity_handle);
   if (!obj || !security_object_valid(obj, SECURITY_OBJECT_KIND_LOCAL_IDENTITY))
   {
     DDS_Security_Exception_set(ex, DDS_AUTH_PLUGIN_CONTEXT, DDS_SECURITY_ERR_UNDEFINED_CODE, DDS_SECURITY_VALIDATION_FAILED, "begin_handshake_request: Invalid initiator_identity_handle provided");
@@ -1133,7 +1149,7 @@ DDS_Security_ValidationResult_t begin_handshake_request(dds_security_authenticat
   }
   localIdent = (LocalIdentityInfo *)obj;
 
-  obj = security_object_find(impl->objectHash, replier_identity_handle);
+  obj = security_object_find(&impl->objectHashTreedef, &impl->objectHash, replier_identity_handle);
   if (!obj || !security_object_valid(obj, SECURITY_OBJECT_KIND_REMOTE_IDENTITY))
   {
     DDS_Security_Exception_set(ex, DDS_AUTH_PLUGIN_CONTEXT, DDS_SECURITY_ERR_UNDEFINED_CODE, DDS_SECURITY_VALIDATION_FAILED, "begin_handshake_request: Invalid replier_identity_handle provided");
@@ -1150,7 +1166,12 @@ DDS_Security_ValidationResult_t begin_handshake_request(dds_security_authenticat
     assert(relation);
     handshake = handshake_info_new(localIdent, remoteIdent, relation);
     handshake->created_in = CREATEDREQUEST;
-    (void)ddsrt_hh_add(impl->objectHash, handshake);
+
+    ddsrt_avl_ipath_t insertion_path;
+    if (ddsrt_avl_lookup_ipath(&impl->objectHashTreedef, &impl->objectHash, handshake, &insertion_path) == NULL)
+    {
+      ddsrt_avl_insert_ipath (&impl->objectHashTreedef, &impl->objectHash, handshake, &insertion_path);
+    }
     created = 1;
   }
   else
@@ -1197,7 +1218,11 @@ DDS_Security_ValidationResult_t begin_handshake_request(dds_security_authenticat
   /* Set the challenge in challenge1 property */
   DDS_Security_BinaryProperty_set_by_value(&tokens[tokidx++], DDS_AUTHTOKEN_PROP_CHALLENGE1, relation->lchallenge->value, sizeof(AuthenticationChallenge));
 
-  (void)ddsrt_hh_add(impl->objectHash, handshake);
+  ddsrt_avl_ipath_t insertion_path;
+  if (ddsrt_avl_lookup_ipath(&impl->objectHashTreedef, &impl->objectHash, handshake, &insertion_path) == NULL)
+  {
+    ddsrt_avl_insert_ipath (&impl->objectHashTreedef, &impl->objectHash, handshake, &insertion_path);
+  }
 
   ddsrt_mutex_unlock(&impl->lock);
 
@@ -1216,7 +1241,11 @@ err_get_public_key:
 err_gen_dh_keys:
   if (created)
   {
-    (void)ddsrt_hh_remove(impl->objectHash, handshake);
+    ddsrt_avl_dpath_t deletion_path;
+    if (ddsrt_avl_lookup_dpath(&impl->objectHashTreedef, &impl->objectHash, handshake, &deletion_path) == NULL)
+    {
+      ddsrt_avl_delete_dpath (&impl->objectHashTreedef, &impl->objectHash, handshake, &deletion_path);
+    }
     security_object_free((SecurityObject *)handshake);
   }
 err_alloc_cid:
@@ -1642,7 +1671,7 @@ DDS_Security_ValidationResult_t begin_handshake_reply(dds_security_authenticatio
 
   ddsrt_mutex_lock(&impl->lock);
 
-  obj = security_object_find(impl->objectHash, replier_identity_handle);
+  obj = security_object_find(&impl->objectHashTreedef, &impl->objectHash, replier_identity_handle);
   if (!obj || !security_object_valid(obj, SECURITY_OBJECT_KIND_LOCAL_IDENTITY))
   {
     DDS_Security_Exception_set(ex, DDS_AUTH_PLUGIN_CONTEXT, DDS_SECURITY_ERR_UNDEFINED_CODE, DDS_SECURITY_VALIDATION_FAILED, "begin_handshake_reply: Invalid replier_identity_handle provided");
@@ -1650,7 +1679,7 @@ DDS_Security_ValidationResult_t begin_handshake_reply(dds_security_authenticatio
   }
   localIdent = (LocalIdentityInfo *)obj;
 
-  obj = security_object_find(impl->objectHash, initiator_identity_handle);
+  obj = security_object_find(&impl->objectHashTreedef, &impl->objectHash, initiator_identity_handle);
   if (!obj || !security_object_valid(obj, SECURITY_OBJECT_KIND_REMOTE_IDENTITY))
   {
     DDS_Security_Exception_set(ex, DDS_AUTH_PLUGIN_CONTEXT, DDS_SECURITY_ERR_UNDEFINED_CODE, DDS_SECURITY_VALIDATION_FAILED, "begin_handshake_reply: Invalid initiator_identity_handle provided");
@@ -1663,7 +1692,12 @@ DDS_Security_ValidationResult_t begin_handshake_reply(dds_security_authenticatio
     assert(relation);
     handshake = handshake_info_new(localIdent, remoteIdent, relation);
     handshake->created_in = CREATEDREPLY;
-    (void)ddsrt_hh_add(impl->objectHash, handshake);
+
+    ddsrt_avl_ipath_t insertion_path;
+    if (ddsrt_avl_lookup_ipath(&impl->objectHashTreedef, &impl->objectHash, handshake, &insertion_path) == NULL)
+    {
+      ddsrt_avl_insert_ipath (&impl->objectHashTreedef, &impl->objectHash, handshake, &insertion_path);
+    }
     created = 1;
   }
   else
@@ -1747,7 +1781,11 @@ DDS_Security_ValidationResult_t begin_handshake_reply(dds_security_authenticatio
 
   assert(tokidx == tokcount);
 
-  (void)ddsrt_hh_add(impl->objectHash, handshake);
+  ddsrt_avl_ipath_t insertion_path;
+  if (ddsrt_avl_lookup_ipath(&impl->objectHashTreedef, &impl->objectHash, handshake, &insertion_path) == NULL)
+  {
+    ddsrt_avl_insert_ipath (&impl->objectHashTreedef, &impl->objectHash, handshake, &insertion_path);
+  }
   handshake_message_out->class_id = ddsrt_strdup(DDS_SECURITY_AUTH_HANDSHAKE_REPLY_TOKEN_ID);
   handshake_message_out->binary_properties._length = tokidx;
   handshake_message_out->binary_properties._buffer = tokens;
@@ -1766,7 +1804,11 @@ err_alloc_cid:
 err_inv_token:
   if (created)
   {
-    (void)ddsrt_hh_remove(impl->objectHash, handshake);
+    ddsrt_avl_dpath_t deletion_path;
+    if (ddsrt_avl_lookup_dpath(&impl->objectHashTreedef, &impl->objectHash, handshake, &deletion_path) != NULL)
+    {
+      ddsrt_avl_delete_dpath (&impl->objectHashTreedef, &impl->objectHash, handshake, &deletion_path);
+    }
     security_object_free((SecurityObject *)handshake);
   }
 err_inv_handle:
@@ -1847,7 +1889,7 @@ DDS_Security_ValidationResult_t process_handshake(dds_security_authentication *i
   memset(handshake_message_out, 0, sizeof(DDS_Security_HandshakeMessageToken));
 
   ddsrt_mutex_lock(&impl->lock);
-  obj = security_object_find(impl->objectHash, handshake_handle);
+  obj = security_object_find(&impl->objectHashTreedef, &impl->objectHash, handshake_handle);
   if (!obj || !security_object_valid(obj, SECURITY_OBJECT_KIND_HANDSHAKE))
   {
     DDS_Security_Exception_set(ex, DDS_AUTH_PLUGIN_CONTEXT, DDS_SECURITY_ERR_UNDEFINED_CODE, DDS_SECURITY_VALIDATION_FAILED, "process_handshake: Invalid replier_identity_handle provided");
@@ -1995,7 +2037,7 @@ DDS_Security_SharedSecretHandle get_shared_secret(dds_security_authentication *i
   dds_security_authentication_impl *impl = (dds_security_authentication_impl *)instance;
   SecurityObject *obj;
   ddsrt_mutex_lock(&impl->lock);
-  obj = security_object_find(impl->objectHash, handshake_handle);
+  obj = security_object_find(&impl->objectHashTreedef, &impl->objectHash, handshake_handle);
   if (!obj || !security_object_valid(obj, SECURITY_OBJECT_KIND_HANDSHAKE))
   {
     DDS_Security_Exception_set(ex, DDS_AUTH_PLUGIN_CONTEXT, DDS_SECURITY_ERR_UNDEFINED_CODE, DDS_SECURITY_VALIDATION_FAILED, "return_handshake_handle: Invalid handle provided");
@@ -2027,7 +2069,7 @@ DDS_Security_boolean get_authenticated_peer_credential_token(dds_security_authen
 
   ddsrt_mutex_lock(&impl->lock);
 
-  handshake = (HandshakeInfo *)security_object_find(impl->objectHash, handshake_handle);
+  handshake = (HandshakeInfo *)security_object_find(&impl->objectHashTreedef, &impl->objectHash, handshake_handle);
   if (!handshake || !SECURITY_OBJECT_VALID(handshake, SECURITY_OBJECT_KIND_HANDSHAKE))
   {
     DDS_Security_Exception_set(ex, DDS_AUTH_PLUGIN_CONTEXT, DDS_SECURITY_ERR_INVALID_PARAMETER_CODE, 0, DDS_SECURITY_ERR_INVALID_PARAMETER_MESSAGE);
@@ -2118,7 +2160,7 @@ DDS_Security_boolean return_handshake_handle(dds_security_authentication *instan
 
   dds_security_authentication_impl *impl = (dds_security_authentication_impl *)instance;
   ddsrt_mutex_lock(&impl->lock);
-  SecurityObject *obj = security_object_find(impl->objectHash, handshake_handle);
+  SecurityObject *obj = security_object_find(&impl->objectHashTreedef, &impl->objectHash, handshake_handle);
   if (!obj || !security_object_valid(obj, SECURITY_OBJECT_KIND_HANDSHAKE))
   {
     DDS_Security_Exception_set(ex, DDS_AUTH_PLUGIN_CONTEXT, DDS_SECURITY_ERR_UNDEFINED_CODE, DDS_SECURITY_VALIDATION_FAILED, "return_handshake_handle: Invalid handle provided");
@@ -2126,7 +2168,12 @@ DDS_Security_boolean return_handshake_handle(dds_security_authentication *instan
   }
   HandshakeInfo *handshake = (HandshakeInfo *)obj;
   assert(handshake->relation);
-  (void)ddsrt_hh_remove(impl->objectHash, obj);
+
+  ddsrt_avl_dpath_t deletion_path;
+  if (ddsrt_avl_lookup_dpath(&impl->objectHashTreedef, &impl->objectHash, obj, &deletion_path) != NULL)
+  {
+    ddsrt_avl_delete_dpath (&impl->objectHashTreedef, &impl->objectHash, obj, &deletion_path);
+  }
   security_object_free((SecurityObject *)handshake);
   ddsrt_mutex_unlock(&impl->lock);
   return true;
@@ -2138,10 +2185,10 @@ err_invalid_handle:
 
 static void invalidate_local_related_objects(dds_security_authentication_impl *impl, LocalIdentityInfo *localIdent)
 {
-  struct ddsrt_hh_iter it;
+  struct ddsrt_avl_iter it;
   SecurityObject *obj;
 
-  for (obj = ddsrt_hh_iter_first(impl->objectHash, &it); obj != NULL; obj = ddsrt_hh_iter_next(&it))
+  for (obj = ddsrt_avl_iter_first(&impl->objectHashTreedef, &impl->objectHash, &it); obj != NULL; obj = ddsrt_avl_iter_next(&it))
   {
     if (obj->kind == SECURITY_OBJECT_KIND_REMOTE_IDENTITY)
     {
@@ -2149,7 +2196,11 @@ static void invalidate_local_related_objects(dds_security_authentication_impl *i
       HandshakeInfo *handshake = find_handshake(impl, SECURITY_OBJECT_HANDLE(localIdent), SECURITY_OBJECT_HANDLE(remoteIdent));
       if (handshake)
       {
-        (void)ddsrt_hh_remove(impl->objectHash, handshake);
+        ddsrt_avl_dpath_t deletion_path;
+        if (ddsrt_avl_lookup_dpath(&impl->objectHashTreedef, &impl->objectHash, handshake, &deletion_path) != NULL)
+        {
+          ddsrt_avl_delete_dpath (&impl->objectHashTreedef, &impl->objectHash, handshake, &deletion_path);
+        }
         security_object_free((SecurityObject *)handshake);
       }
       IdentityRelation *relation = find_identity_relation(remoteIdent, SECURITY_OBJECT_HANDLE(localIdent));
@@ -2161,16 +2212,25 @@ static void invalidate_local_related_objects(dds_security_authentication_impl *i
 
 static void invalidate_remote_related_objects(dds_security_authentication_impl *impl, RemoteIdentityInfo *remoteIdentity)
 {
-  struct ddsrt_hh_iter it;
-  for (IdentityRelation *relation = ddsrt_hh_iter_first(remoteIdentity->linkHash, &it); relation != NULL; relation = ddsrt_hh_iter_next(&it))
+  struct ddsrt_avl_iter it;
+  for (IdentityRelation *relation = ddsrt_avl_iter_first(&remoteIdentity->linkHashTreedef, &remoteIdentity->linkHash, &it); relation != NULL; relation = ddsrt_avl_iter_next(&it))
   {
     HandshakeInfo *handshake = find_handshake(impl, SECURITY_OBJECT_HANDLE(relation->localIdentity), SECURITY_OBJECT_HANDLE(remoteIdentity));
     if (handshake)
     {
-      (void)ddsrt_hh_remove(impl->objectHash, handshake);
+      ddsrt_avl_dpath_t deletion_path;
+      if (ddsrt_avl_lookup_dpath(&impl->objectHashTreedef, &impl->objectHash, handshake, &deletion_path) != NULL)
+      {
+        ddsrt_avl_delete_dpath (&impl->objectHashTreedef, &impl->objectHash, handshake, &deletion_path);
+      }
       security_object_free((SecurityObject *)handshake);
     }
-    (void)ddsrt_hh_remove(remoteIdentity->linkHash, relation);
+
+    ddsrt_avl_dpath_t deletion_path;
+    if (ddsrt_avl_lookup_dpath(&remoteIdentity->linkHashTreedef, &remoteIdentity->linkHash, relation, &deletion_path) != NULL)
+    {
+      ddsrt_avl_delete_dpath (&remoteIdentity->linkHashTreedef, &remoteIdentity->linkHash, relation, &deletion_path);
+    }
     security_object_free((SecurityObject *)relation);
   }
 }
@@ -2187,10 +2247,11 @@ DDS_Security_boolean return_identity_handle(dds_security_authentication *instanc
   SecurityObject *obj;
   LocalIdentityInfo *localIdent;
   RemoteIdentityInfo *remoteIdent;
+  ddsrt_avl_dpath_t deletion_path;
 
   /* Currently the implementation of the handle does not provide information about the kind of handle. In this case a valid handle could refer to a LocalIdentityObject or a RemoteIdentityObject */
   ddsrt_mutex_lock(&impl->lock);
-  if (!(obj = security_object_find(impl->objectHash, identity_handle)))
+  if (!(obj = security_object_find(&impl->objectHashTreedef, &impl->objectHash, identity_handle)))
   {
     DDS_Security_Exception_set(ex, DDS_AUTH_PLUGIN_CONTEXT, DDS_SECURITY_ERR_UNDEFINED_CODE, DDS_SECURITY_VALIDATION_FAILED, "return_identity_handle: Invalid handle provided");
     goto failed;
@@ -2202,7 +2263,11 @@ DDS_Security_boolean return_identity_handle(dds_security_authentication *instanc
     if (localIdent->timer != 0)
       dds_security_timed_dispatcher_remove(impl->dispatcher, localIdent->timer);
     invalidate_local_related_objects(impl, localIdent);
-    (void)ddsrt_hh_remove(impl->objectHash, obj);
+
+    if (ddsrt_avl_lookup_dpath(&impl->objectHashTreedef, &impl->objectHash, obj, &deletion_path) != NULL)
+    {
+      ddsrt_avl_delete_dpath (&impl->objectHashTreedef, &impl->objectHash, obj, &deletion_path);
+    }
     security_object_free(obj);
     break;
   case SECURITY_OBJECT_KIND_REMOTE_IDENTITY:
@@ -2210,8 +2275,14 @@ DDS_Security_boolean return_identity_handle(dds_security_authentication *instanc
     if (remoteIdent->timer != 0)
       dds_security_timed_dispatcher_remove(impl->dispatcher, remoteIdent->timer);
     invalidate_remote_related_objects(impl, remoteIdent);
-    (void)ddsrt_hh_remove(impl->remoteGuidHash, remoteIdent);
-    (void)ddsrt_hh_remove(impl->objectHash, obj);
+    if (ddsrt_avl_lookup_dpath(&impl->remoteGuidHashTreedef, &impl->remoteGuidHash, remoteIdent, &deletion_path) != NULL)
+    {
+      ddsrt_avl_delete_dpath (&impl->remoteGuidHashTreedef, &impl->remoteGuidHash, remoteIdent, &deletion_path);
+    }
+    if (ddsrt_avl_lookup_dpath(&impl->objectHashTreedef, &impl->objectHash, obj, &deletion_path) != NULL)
+    {
+      ddsrt_avl_delete_dpath (&impl->objectHashTreedef, &impl->objectHash, obj, &deletion_path);
+    }
     security_object_free(obj);
     break;
   default:
@@ -2262,8 +2333,15 @@ int32_t init_authentication(const char *argument, void **context, struct ddsi_do
   authentication->base.return_identity_handle = &return_identity_handle;
   authentication->base.return_sharedsecret_handle = &return_sharedsecret_handle;
   ddsrt_mutex_init(&authentication->lock);
-  authentication->objectHash = ddsrt_hh_new(32, security_object_hash, security_object_equal);
-  authentication->remoteGuidHash = ddsrt_hh_new(32, remote_guid_hash, remote_guid_equal);
+
+  ddsrt_avl_treedef_t objectHashTreedef = DDSRT_AVL_TREEDEF_INITIALIZER(offsetof(SecurityObject, avlnode), 0, security_object_compare, NULL);
+  authentication->objectHashTreedef = objectHashTreedef;
+  ddsrt_avl_init(&authentication->objectHashTreedef, &authentication->objectHash);
+
+  ddsrt_avl_treedef_t remoteGuidHashTreedef = DDSRT_AVL_TREEDEF_INITIALIZER(offsetof(RemoteIdentityInfo, avlnode), 0, remote_guid_compare, NULL);
+  authentication->remoteGuidHashTreedef = remoteGuidHashTreedef;
+  ddsrt_avl_init(&authentication->remoteGuidHashTreedef, &authentication->remoteGuidHash);
+
   memset(&authentication->trustedCAList, 0, sizeof(X509Seq));
   authentication->include_optional = gv->handshake_include_optional;
 
@@ -2279,15 +2357,11 @@ int32_t finalize_authentication(void *instance)
   {
     ddsrt_mutex_lock(&authentication->lock);
     dds_security_timed_dispatcher_free(authentication->dispatcher);
-    if (authentication->remoteGuidHash)
-      ddsrt_hh_free(authentication->remoteGuidHash);
-    if (authentication->objectHash)
-    {
-      struct ddsrt_hh_iter it;
-      for (SecurityObject *obj = ddsrt_hh_iter_first(authentication->objectHash, &it); obj != NULL; obj = ddsrt_hh_iter_next(&it))
-        security_object_free(obj);
-      ddsrt_hh_free(authentication->objectHash);
-    }
+    ddsrt_avl_free(&authentication->remoteGuidHashTreedef, &authentication->remoteGuidHash, NULL);
+    struct ddsrt_avl_iter it;
+    for (SecurityObject *obj = ddsrt_avl_iter_first(&authentication->objectHashTreedef, &authentication->objectHash, &it); obj != NULL; obj = ddsrt_avl_iter_next(&it))
+      security_object_free(obj);
+    ddsrt_avl_free(&authentication->objectHashTreedef, &authentication->objectHash, NULL);
     free_ca_list_contents(&(authentication->trustedCAList));
     ddsrt_mutex_unlock(&authentication->lock);
     ddsrt_mutex_destroy(&authentication->lock);

@@ -35,9 +35,6 @@
 #include "dds__entity.h"
 #include "dds__writer.h"
 
-#define USE_EHH 0
-
-
 struct dds_whc_default_node {
   struct ddsi_whc_node common;
   struct dds_whc_default_node *next_seq; /* next in this interval */
@@ -53,6 +50,7 @@ struct dds_whc_default_node {
 #ifdef DDS_HAS_LIFESPAN
   struct ddsi_lifespan_fhnode lifespan; /* fibheap node for lifespan */
 #endif
+  ddsrt_avl_node_t avlnode;
   struct ddsi_serdata *serdata;
 };
 DDSRT_STATIC_ASSERT (offsetof (struct dds_whc_default_node, common) == 0);
@@ -73,15 +71,9 @@ struct whc_idxnode {
 #ifdef DDS_HAS_DEADLINE_MISSED
   struct deadline_elem deadline; /* list element for deadline missed */
 #endif
+  ddsrt_avl_node_t avlnode;
   struct dds_whc_default_node *hist[];
 };
-
-#if USE_EHH
-struct whc_seq_entry {
-  ddsi_seqno_t seq;
-  struct dds_whc_default_node *whcn;
-};
-#endif
 
 struct whc_writer_info {
   dds_writer * writer; /* can be NULL, eg in case of whc for built-in writers */
@@ -107,13 +99,11 @@ struct whc_impl {
   ddsi_seqno_t max_drop_seq; /* samples in whc with seq <= max_drop_seq => transient-local */
   struct whc_intvnode *open_intv; /* interval where next sample will go (usually) */
   struct dds_whc_default_node *maxseq_node; /* NULL if empty; if not in open_intv, open_intv is empty */
-#if USE_EHH
-  struct ddsrt_ehh *seq_hash;
-#else
-  struct ddsrt_hh *seq_hash;
-#endif
+  ddsrt_avl_treedef_t seq_hash_treedef;
+  ddsrt_avl_tree_t seq_hash;
   uint32_t n_instances;
-  struct ddsrt_hh *idx_hash;
+  ddsrt_avl_treedef_t idx_hash_treedef;
+  ddsrt_avl_tree_t idx_hash;
   ddsrt_avl_tree_t seq;
 #ifdef DDS_HAS_LIFESPAN
   struct ddsi_lifespan_adm lifespan; /* Lifespan administration */
@@ -193,53 +183,18 @@ static const struct ddsi_whc_ops whc_ops = {
 static uint32_t whc_count;
 static struct ddsi_freelist whc_node_freelist;
 
-#if USE_EHH
-static uint32_t whc_seq_entry_hash (const void *vn)
-{
-  const struct whc_seq_entry *n = vn;
-  /* we hash the lower 32 bits, on the assumption that with 4 billion
-   samples in between there won't be significant correlation */
-  const uint64_t c = UINT64_C (16292676669999574021);
-  const uint32_t x = (uint32_t) n->seq;
-  return (uint32_t) ((x * c) >> 32);
-}
-
-static int whc_seq_entry_eq (const void *va, const void *vb)
-{
-  const struct whc_seq_entry *a = va;
-  const struct whc_seq_entry *b = vb;
-  return a->seq == b->seq;
-}
-#else
-static uint32_t whc_node_hash (const void *vn)
-{
-  const struct dds_whc_default_node *n = vn;
-  /* we hash the lower 32 bits, on the assumption that with 4 billion
-   samples in between there won't be significant correlation */
-  const uint64_t c = UINT64_C (16292676669999574021);
-  const uint32_t x = (uint32_t) n->common.seq;
-  return (uint32_t) ((x * c) >> 32);
-}
-
-static bool whc_node_eq (const void *va, const void *vb)
+static int whc_node_compare (const void *va, const void *vb)
 {
   const struct dds_whc_default_node *a = va;
   const struct dds_whc_default_node *b = vb;
-  return a->common.seq == b->common.seq;
-}
-#endif
-
-static uint32_t whc_idxnode_hash_key (const void *vn)
-{
-  const struct whc_idxnode *n = vn;
-  return (uint32_t)n->iid;
+  return (a->common.seq > b->common.seq) - (a->common.seq < b->common.seq);
 }
 
-static bool whc_idxnode_eq_key (const void *va, const void *vb)
+static int whc_idxnode_key_compare (const void *va, const void *vb)
 {
   const struct whc_idxnode *a = va;
   const struct whc_idxnode *b = vb;
-  return (a->iid == b->iid);
+  return (a->iid > b->iid) - (a->iid < b->iid);
 }
 
 static int compare_seq (const void *va, const void *vb)
@@ -315,41 +270,21 @@ static void check_whc (const struct whc_impl *whc)
 
 static void insert_whcn_in_hash (struct whc_impl *whc, struct dds_whc_default_node *whcn)
 {
-  /* precondition: whcn is not in hash */
-#if USE_EHH
-  struct whc_seq_entry e = { .seq = whcn->common.seq, .whcn = whcn };
-  if (!ddsrt_ehh_add (whc->seq_hash, &e))
-    assert (0);
-#else
-  ddsrt_hh_add_absent (whc->seq_hash, whcn);
-#endif
+  /* precondition: whcn is not in store */
+  ddsrt_avl_insert (&whc->seq_hash_treedef, &whc->seq_hash, whcn);
 }
 
 static void remove_whcn_from_hash (struct whc_impl *whc, struct dds_whc_default_node *whcn)
 {
   /* precondition: whcn is in hash */
-#if USE_EHH
-  struct whc_seq_entry e = { .seq = whcn->common.seq };
-  if (!ddsrt_ehh_remove (whc->seq_hash, &e))
-    assert (0);
-#else
-  ddsrt_hh_remove_present (whc->seq_hash, whcn);
-#endif
+  ddsrt_avl_delete (&whc->seq_hash_treedef, &whc->seq_hash, whcn);
 }
 
 static struct dds_whc_default_node *whc_findseq (const struct whc_impl *whc, ddsi_seqno_t seq)
 {
-#if USE_EHH
-  struct whc_seq_entry e = { .seq = seq }, *r;
-  if ((r = ddsrt_ehh_lookup (whc->seq_hash, &e)) != NULL)
-    return r->whcn;
-  else
-    return NULL;
-#else
   struct dds_whc_default_node template;
   template.common.seq = seq;
-  return ddsrt_hh_lookup (whc->seq_hash, &template);
-#endif
+  return ddsrt_avl_lookup (&whc->seq_hash_treedef, &whc->seq_hash, &template);
 }
 
 static struct dds_whc_default_node *whc_findkey (const struct whc_impl *whc, const struct ddsi_serdata *serdata_key)
@@ -361,7 +296,7 @@ static struct dds_whc_default_node *whc_findkey (const struct whc_impl *whc, con
   struct whc_idxnode *n;
   check_whc (whc);
   template.idxn.iid = ddsi_tkmap_lookup (whc->tkmap, serdata_key);
-  n = ddsrt_hh_lookup (whc->idx_hash, &template.idxn);
+  n = ddsrt_avl_lookup (&whc->idx_hash_treedef, &whc->idx_hash, &template.idxn);
   if (n == NULL)
     return NULL;
   else
@@ -464,12 +399,14 @@ struct ddsi_whc *dds_whc_new (struct ddsi_domaingv *gv, const struct whc_writer_
   whc->sample_overhead = sample_overhead;
   whc->fragment_size = gv->config.fragment_size;
   whc->n_instances = 0;
-  whc->idx_hash = ddsrt_hh_new (1, whc_idxnode_hash_key, whc_idxnode_eq_key);
-#if USE_EHH
-  whc->seq_hash = ddsrt_ehh_new (sizeof (struct whc_seq_entry), 32, whc_seq_entry_hash, whc_seq_entry_eq);
-#else
-  whc->seq_hash = ddsrt_hh_new (1, whc_node_hash, whc_node_eq);
-#endif
+
+  ddsrt_avl_treedef_t idx_hash_treedef = DDSRT_AVL_TREEDEF_INITIALIZER(offsetof(struct whc_idxnode, avlnode), 0, whc_idxnode_key_compare, NULL);
+  whc->idx_hash_treedef = idx_hash_treedef;
+  ddsrt_avl_init(&whc->idx_hash_treedef, &whc->idx_hash);
+
+  ddsrt_avl_treedef_t seq_hash_treedef = DDSRT_AVL_TREEDEF_INITIALIZER(offsetof(struct dds_whc_default_node, avlnode), 0, whc_node_compare, NULL);
+  whc->seq_hash_treedef = seq_hash_treedef;
+  ddsrt_avl_init(&whc->seq_hash_treedef, &whc->seq_hash);
 
 #ifdef DDS_HAS_LIFESPAN
   ddsi_lifespan_init (gv, &whc->lifespan, offsetof(struct whc_impl, lifespan), offsetof(struct dds_whc_default_node, lifespan), whc_sample_expired_cb);
@@ -522,14 +459,14 @@ static void whc_default_free (struct ddsi_whc *whc_generic)
   ddsi_deadline_fini (&whc->deadline);
 #endif
 
-  struct ddsrt_hh_iter it;
+  struct ddsrt_avl_iter it;
   struct whc_idxnode *idxn;
-  for (idxn = ddsrt_hh_iter_first (whc->idx_hash, &it); idxn != NULL; idxn = ddsrt_hh_iter_next (&it))
+  for (idxn = ddsrt_avl_iter_first (&whc->idx_hash_treedef, &whc->idx_hash, &it); idxn != NULL; idxn = ddsrt_avl_iter_next (&it))
   {
     ddsi_tkmap_instance_unref (whc->tkmap, idxn->tk);
     ddsrt_free (idxn);
   }
-  ddsrt_hh_free (whc->idx_hash);
+  ddsrt_avl_free (&whc->idx_hash_treedef, &whc->idx_hash, NULL);
 
   {
     struct dds_whc_default_node *whcn = whc->maxseq_node;
@@ -552,11 +489,7 @@ static void whc_default_free (struct ddsi_whc *whc_generic)
     ddsi_freelist_fini (&whc_node_freelist, ddsrt_free);
   ddsrt_mutex_unlock (ddsrt_get_singleton_mutex ());
 
-#if USE_EHH
-  ddsrt_ehh_free (whc->seq_hash);
-#else
-  ddsrt_hh_free (whc->seq_hash);
-#endif
+  ddsrt_avl_free (&whc->seq_hash_treedef, &whc->seq_hash, NULL);
   ddsrt_mutex_destroy (&whc->lock);
   ddsrt_free (whc);
 }
@@ -681,7 +614,7 @@ static void free_one_instance_from_idx (struct whc_impl *whc, ddsi_seqno_t max_d
 
 static void delete_one_instance_from_idx (struct whc_impl *whc, ddsi_seqno_t max_drop_seq, struct whc_idxnode *idxn)
 {
-  ddsrt_hh_remove_present (whc->idx_hash, idxn);
+  ddsrt_avl_delete (&whc->idx_hash_treedef, &whc->idx_hash, idxn);
 #ifdef DDS_HAS_DEADLINE_MISSED
   ddsi_deadline_unregister_instance_locked (&whc->deadline, &idxn->deadline);
 #endif
@@ -1055,7 +988,7 @@ static uint32_t whc_default_remove_acked_messages_full (struct whc_impl *whc, dd
           TRACE (" del %p %"PRIu64, (void *) oldn, oldn->common.seq);
           whc_delete_one (whc, oldn);
 #ifndef NDEBUG
-          assert (ddsrt_hh_lookup (whc->idx_hash, &template) == idxn);
+          assert (ddsrt_avl_lookup (&whc->idx_hash_treedef, &whc->idx_hash, &template) == idxn);
 #endif
         }
       }
@@ -1225,7 +1158,7 @@ static int whc_default_insert (struct ddsi_whc *whc_generic, ddsi_seqno_t max_dr
   }
 
   template.idxn.iid = tk->m_iid;
-  if ((idxn = ddsrt_hh_lookup (whc->idx_hash, &template)) != NULL)
+  if ((idxn = ddsrt_avl_lookup (&whc->idx_hash_treedef, &whc->idx_hash, &template)) != NULL)
   {
     /* Unregisters cause deleting of index entry, non-unregister of adding/overwriting in history */
     TRACE (" idxn %p", (void *)idxn);
@@ -1311,7 +1244,7 @@ static int whc_default_insert (struct ddsi_whc *whc_generic, ddsi_seqno_t max_dr
         newn->idxnode_pos = 0;
       }
       whc->n_instances++;
-      ddsrt_hh_add_absent (whc->idx_hash, idxn);
+      ddsrt_avl_insert (&whc->idx_hash_treedef, &whc->idx_hash, idxn);
 #ifdef DDS_HAS_DEADLINE_MISSED
       ddsi_deadline_register_instance_locked (&whc->deadline, &idxn->deadline, ddsrt_time_monotonic ());
 #endif

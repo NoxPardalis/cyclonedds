@@ -11,11 +11,11 @@
 #include <assert.h>
 #include <string.h>
 
+#include "dds/ddsrt/avl.h"
 #include "dds/ddsrt/heap.h"
 #include "dds/ddsrt/sync.h"
 #include "dds/ddsrt/time.h"
 #include "dds/ddsrt/threads.h"
-#include "dds/ddsrt/hopscotch.h"
 #include "dds/ddsi/ddsi_threadmon.h"
 #include "dds/ddsi/ddsi_unused.h"
 #include "dds/ddsi/ddsi_domaingv.h" /* for mattr, cattr */
@@ -29,6 +29,7 @@ struct alive_vt {
 };
 
 struct threadmon_domain {
+  ddsrt_avl_node_t avlnode;
   const struct ddsi_domaingv *gv;
   unsigned n_not_alive;
   size_t msgpos;
@@ -47,14 +48,23 @@ struct ddsi_threadmon {
   ddsrt_mutex_t lock;
   ddsrt_cond_t cond;
   struct ddsi_thread_state *thrst;
-  struct ddsrt_hh *domains;
+  ddsrt_avl_tree_t domains;
 };
+
+static int threadmon_domain_compare(const void *va, const void *vb)
+{
+  const struct threadmon_domain *a = va;
+  const struct threadmon_domain *b = vb;
+  return (a->gv > b->gv) - (a->gv < b->gv);
+}
+
+static ddsrt_avl_treedef_t THREADMON_DOMAIN_TREEDEF = DDSRT_AVL_TREEDEF_INITIALIZER(offsetof(struct threadmon_domain, avlnode), 0, threadmon_domain_compare, NULL);
 
 static struct threadmon_domain *find_domain (struct ddsi_threadmon *sl, const struct ddsi_domaingv *gv)
 {
   struct threadmon_domain dummy;
   dummy.gv = gv;
-  return ddsrt_hh_lookup (sl->domains, &dummy);
+  return ddsrt_avl_lookup (&THREADMON_DOMAIN_TREEDEF, &sl->domains, &dummy);
 }
 
 static void update_av_ary (struct ddsi_threadmon *sl, uint32_t nthreads)
@@ -161,8 +171,8 @@ static uint32_t threadmon_thread (struct ddsi_threadmon *sl)
        to flush the messages if we want to avoid mixing up domains; and we'd still like to dump
        stack traces only once if there are stuck threads, even though a deadlock typically involves
        multiple threads. */
-    struct ddsrt_hh_iter it;
-    for (struct threadmon_domain *tmdom = ddsrt_hh_iter_first (sl->domains, &it); tmdom != NULL; tmdom = ddsrt_hh_iter_next (&it))
+    struct ddsrt_avl_iter it;
+    for (struct threadmon_domain *tmdom = ddsrt_avl_iter_first (&THREADMON_DOMAIN_TREEDEF, &sl->domains, &it); tmdom != NULL; tmdom = ddsrt_avl_iter_next (&it))
     {
       if (tmdom->n_not_alive == 0)
         DDS_CTRACE (&tmdom->gv->logconfig, "%s: OK\n", tmdom->msg);
@@ -206,21 +216,6 @@ static uint32_t threadmon_thread (struct ddsi_threadmon *sl)
   return 0;
 }
 
-static uint32_t threadmon_domain_hash (const void *va)
-{
-  const struct threadmon_domain *a = va;
-  const uint32_t u = (uint16_t) ((uintptr_t) a->gv >> 3);
-  const uint32_t v = u * 0xb4817365;
-  return v >> 16;
-}
-
-static bool threadmon_domain_eq (const void *va, const void *vb)
-{
-  const struct threadmon_domain *a = va;
-  const struct threadmon_domain *b = vb;
-  return a->gv == b->gv;
-}
-
 struct ddsi_threadmon *ddsi_threadmon_new (int64_t liveliness_monitoring_interval, bool noprogress_log_stacktraces)
 {
   struct ddsi_threadmon *sl;
@@ -230,7 +225,7 @@ struct ddsi_threadmon *ddsi_threadmon_new (int64_t liveliness_monitoring_interva
   sl->thrst = NULL;
   sl->liveliness_monitoring_interval = liveliness_monitoring_interval;
   sl->noprogress_log_stacktraces = noprogress_log_stacktraces;
-  sl->domains = ddsrt_hh_new (1, threadmon_domain_hash, threadmon_domain_eq);
+  ddsrt_avl_init(&THREADMON_DOMAIN_TREEDEF, &sl->domains);
   /* service lease update thread dynamically grows av_ary */
   sl->av_ary_size = 0;
   sl->av_ary = NULL;
@@ -268,7 +263,7 @@ void ddsi_threadmon_register_domain (struct ddsi_threadmon *sl, const struct dds
     tmdom->msg[0] = 0;
 
     ddsrt_mutex_lock (&sl->lock);
-    ddsrt_hh_add_absent (sl->domains, tmdom);
+    ddsrt_avl_insert (&THREADMON_DOMAIN_TREEDEF, &sl->domains, tmdom);
     ddsrt_mutex_unlock (&sl->lock);
   }
 }
@@ -280,9 +275,9 @@ void ddsi_threadmon_unregister_domain (struct ddsi_threadmon *sl, const struct d
     ddsrt_mutex_lock (&sl->lock);
     struct threadmon_domain dummy;
     dummy.gv = gv;
-    struct threadmon_domain *tmdom = ddsrt_hh_lookup (sl->domains, &dummy);
+    struct threadmon_domain *tmdom = ddsrt_avl_lookup (&THREADMON_DOMAIN_TREEDEF, &sl->domains, &dummy);
     assert (tmdom);
-    ddsrt_hh_remove_present (sl->domains, tmdom);
+    ddsrt_avl_delete(&THREADMON_DOMAIN_TREEDEF, &sl->domains, tmdom);
     ddsrt_mutex_unlock (&sl->lock);
     ddsrt_free (tmdom);
   }
@@ -303,12 +298,12 @@ void ddsi_threadmon_stop (struct ddsi_threadmon *sl)
 void ddsi_threadmon_free (struct ddsi_threadmon *sl)
 {
 #ifndef NDEBUG
-  struct ddsrt_hh_iter it;
-  assert (ddsrt_hh_iter_first (sl->domains, &it) == NULL);
+  struct ddsrt_avl_iter it;
+  assert (ddsrt_avl_iter_first (&THREADMON_DOMAIN_TREEDEF, &sl->domains, &it) == NULL);
 #endif
   ddsrt_cond_destroy (&sl->cond);
   ddsrt_mutex_destroy (&sl->lock);
-  ddsrt_hh_free (sl->domains);
+  ddsrt_avl_free (&THREADMON_DOMAIN_TREEDEF, &sl->domains, NULL);
   ddsrt_free (sl->av_ary);
   ddsrt_free (sl);
 }

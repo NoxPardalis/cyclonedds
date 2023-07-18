@@ -34,7 +34,6 @@ const ddsrt_avl_treedef_t endpoint_relation_treedef =
 const ddsrt_avl_treedef_t specific_key_treedef =
   DDSRT_AVL_TREEDEF_INITIALIZER (offsetof (struct key_relation, avlnode), offsetof (struct key_relation, key_id), compare_relation_key, 0);
 
-
 static int compare_participant_handle(const void *va, const void *vb)
 {
   const DDS_Security_ParticipantCryptoHandle *ha = va;
@@ -129,7 +128,7 @@ void crypto_object_release(CryptoObject *obj)
 
 CryptoObject * crypto_object_table_find_by_template(const struct CryptoObjectTable *table, const void *template)
 {
-  return (CryptoObject *)ddsrt_hh_lookup(table->htab, template);
+  return (CryptoObject *)ddsrt_avl_lookup(&table->htab_treedef, &table->htab, template);
 }
 
 static CryptoObject * default_crypto_table_find(const struct CryptoObjectTable *table, const void *arg)
@@ -137,6 +136,21 @@ static CryptoObject * default_crypto_table_find(const struct CryptoObjectTable *
   struct CryptoObject template;
   template.handle = *(int64_t *)arg;
   return crypto_object_table_find_by_template(table, &template);
+}
+
+static CryptoObjectHashFunction HASHFNC;
+static CryptoObjectEqualFunction EQUALFNC;
+
+static int crypto_object_compare(const void *a, const void *b)
+{
+  int ordering = 0;
+  if (!EQUALFNC(a, b)) {
+    uint32_t hash_a = HASHFNC(a);
+    uint32_t hash_b = HASHFNC(b);
+
+    ordering = (hash_a > hash_b) - (hash_a < hash_b);
+  }
+  return ordering;
 }
 
 struct CryptoObjectTable * crypto_object_table_new(CryptoObjectHashFunction hashfnc, CryptoObjectEqualFunction equalfnc, CryptoObjectFindFunction findfnc)
@@ -147,7 +161,15 @@ struct CryptoObjectTable * crypto_object_table_new(CryptoObjectHashFunction hash
   if (!equalfnc)
     equalfnc = crypto_object_equal;
   table = ddsrt_malloc(sizeof(*table));
-  table->htab = ddsrt_hh_new(32, hashfnc, equalfnc);
+
+  HASHFNC = hashfnc;
+  EQUALFNC = equalfnc;
+
+  ddsrt_avl_treedef_t crypto_object_treedef =
+    DDSRT_AVL_TREEDEF_INITIALIZER(offsetof(CryptoObject, avlnode), 0, crypto_object_compare, NULL);
+  table->htab_treedef = crypto_object_treedef;
+
+  ddsrt_avl_init(&table->htab_treedef, &table->htab);
   ddsrt_mutex_init(&table->lock);
   table->findfnc = findfnc ? findfnc : default_crypto_table_find;
   return table;
@@ -155,19 +177,19 @@ struct CryptoObjectTable * crypto_object_table_new(CryptoObjectHashFunction hash
 
 void crypto_object_table_free(struct CryptoObjectTable *table)
 {
-  struct ddsrt_hh_iter it;
+  struct ddsrt_avl_iter it;
   CryptoObject *obj;
 
   if (!table)
     return;
 
   ddsrt_mutex_lock(&table->lock);
-  for (obj = ddsrt_hh_iter_first(table->htab, &it); obj; obj = ddsrt_hh_iter_next(&it))
+  for (obj = ddsrt_avl_iter_first(&table->htab_treedef, &table->htab, &it); obj; obj = ddsrt_avl_iter_next(&it))
   {
-    ddsrt_hh_remove(table->htab, obj);
+    ddsrt_avl_delete(&table->htab_treedef, &table->htab, obj);
     crypto_object_release(obj);
   }
-  ddsrt_hh_free(table->htab);
+  ddsrt_avl_free(&table->htab_treedef, &table->htab, NULL);
   ddsrt_mutex_unlock(&table->lock);
   ddsrt_mutex_destroy(&table->lock);
   ddsrt_free(table);
@@ -182,7 +204,14 @@ CryptoObject * crypto_object_table_insert(struct CryptoObjectTable *table, Crypt
 
   ddsrt_mutex_lock(&table->lock);
   if (!(cur = crypto_object_keep (table->findfnc(table, &object->handle))))
-    ddsrt_hh_add(table->htab, crypto_object_keep(object));
+  {
+    ddsrt_avl_ipath_t insertion_path;
+    void *keep_object = crypto_object_keep(object);
+    if (ddsrt_avl_lookup_ipath(&table->htab_treedef, &table->htab, keep_object, &insertion_path) == NULL)
+    {
+      ddsrt_avl_insert_ipath (&table->htab_treedef, &table->htab, keep_object, &insertion_path);
+    }
+  }
   else
     crypto_object_release(cur);
   ddsrt_mutex_unlock(&table->lock);
@@ -196,7 +225,11 @@ void crypto_object_table_remove_object(struct CryptoObjectTable *table, CryptoOb
   assert (object);
 
   ddsrt_mutex_lock (&table->lock);
-  ddsrt_hh_remove (table->htab, object);
+  ddsrt_avl_dpath_t deletion_path;
+  if (ddsrt_avl_lookup_dpath(&table->htab_treedef, &table->htab, object, &deletion_path) != NULL)
+  {
+    ddsrt_avl_delete_dpath (&table->htab_treedef, &table->htab, object, &deletion_path);
+  }
   ddsrt_mutex_unlock (&table->lock);
 
   crypto_object_release (object);
@@ -209,7 +242,11 @@ CryptoObject * crypto_object_table_remove(struct CryptoObjectTable *table, int64
   ddsrt_mutex_lock (&table->lock);
   if ((object = crypto_object_keep (table->findfnc(table, &handle))))
   {
-    ddsrt_hh_remove (table->htab, object);
+    ddsrt_avl_dpath_t deletion_path;
+    if (ddsrt_avl_lookup_dpath(&table->htab_treedef, &table->htab, object, &deletion_path) != NULL)
+    {
+      ddsrt_avl_delete_dpath (&table->htab_treedef, &table->htab, object, &deletion_path);
+    }
     crypto_object_release (object);
   }
   ddsrt_mutex_unlock (&table->lock);
@@ -230,14 +267,14 @@ CryptoObject * crypto_object_table_find(struct CryptoObjectTable *table, int64_t
 
 void crypto_object_table_walk(struct CryptoObjectTable *table, CryptoObjectTableCallback callback, void *arg)
 {
-  struct ddsrt_hh_iter it;
+  struct ddsrt_avl_iter it;
   CryptoObject *obj;
   int r = 1;
 
   assert(table);
   assert(callback);
   ddsrt_mutex_lock (&table->lock);
-  for (obj = ddsrt_hh_iter_first (table->htab, &it); r && obj; obj = ddsrt_hh_iter_next (&it))
+  for (obj = ddsrt_avl_iter_first (&table->htab_treedef, &table->htab, &it); r && obj; obj = ddsrt_avl_iter_next (&it))
     r = callback(obj, arg);
   ddsrt_mutex_unlock(&table->lock);
 }

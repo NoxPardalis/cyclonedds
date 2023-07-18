@@ -37,6 +37,7 @@ struct ddsi_topic_definition {
   struct dds_qos *xqos; /* contains also the topic name and type name */
   uint32_t refc;
   struct ddsi_domaingv *gv;
+  ddsrt_avl_node_t avlnode;
 };
 
 struct ddsi_topic {

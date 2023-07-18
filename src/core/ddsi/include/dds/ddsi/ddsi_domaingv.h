@@ -313,7 +313,8 @@ struct ddsi_domaingv {
   struct ddsi_mcgroup_membership *mship;
 
   ddsrt_mutex_t sertypes_lock;
-  struct ddsrt_hh *sertypes;
+  ddsrt_avl_treedef_t sertypes_treedef;
+  ddsrt_avl_tree_t sertypes;
 
 #ifdef DDS_HAS_TYPE_DISCOVERY
   ddsrt_mutex_t typelib_lock;
@@ -324,7 +325,8 @@ struct ddsi_domaingv {
 #endif
 #ifdef DDS_HAS_TOPIC_DISCOVERY
   ddsrt_mutex_t topic_defs_lock;
-  struct ddsrt_hh *topic_defs;
+  ddsrt_avl_treedef_t topic_defs_treedef;
+  ddsrt_avl_tree_t topic_defs;
 #endif
 
   ddsrt_mutex_t new_topic_lock;

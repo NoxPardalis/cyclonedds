@@ -14,7 +14,7 @@
 #include "dds/ddsrt/sync.h"
 #include "dds/ddsrt/heap.h"
 #include "dds/ddsrt/random.h"
-#include "dds/ddsrt/hopscotch.h"
+#include "dds/ddsrt/avl.h"
 #include "dds/ddsi/ddsi_thread.h"
 #include "dds__handles.h"
 #include "dds__types.h"
@@ -57,7 +57,9 @@ built-in topics:
 #define MAX_HANDLES (INT32_MAX / 128)
 
 struct dds_handle_server {
-  struct ddsrt_hh *ht;
+  // TODO keep the ddsrt_avl_tree_t as a pointer and then `ddsrt_malloc` it?
+  bool initialized;
+  ddsrt_avl_tree_t ht;
   size_t count;
   ddsrt_mutex_t lock;
   ddsrt_cond_t cond;
@@ -65,29 +67,25 @@ struct dds_handle_server {
 
 static struct dds_handle_server handles;
 
-static uint32_t handle_hash (const void *va)
-{
-  /* handles are already pseudo-random numbers, so not much point in hashing it again */
-  const struct dds_handle_link *a = va;
-  return (uint32_t) a->hdl;
-}
-
-static bool handle_equal (const void *va, const void *vb)
+static int handle_compare(const void *va, const void *vb)
 {
   const struct dds_handle_link *a = va;
   const struct dds_handle_link *b = vb;
-  return a->hdl == b->hdl;
+  return (a->hdl > b->hdl) - (a->hdl < b->hdl);
 }
+static ddsrt_avl_treedef_t HANDLES_TREEDEF = DDSRT_AVL_TREEDEF_INITIALIZER(offsetof(struct dds_handle_link, avlnode), 0, handle_compare, NULL);
+
 
 dds_return_t dds_handle_server_init (void)
 {
   /* called with ddsrt's singleton mutex held (see dds_init/fini) */
-  if (handles.ht == NULL)
+  if (!handles.initialized)
   {
-    handles.ht = ddsrt_hh_new (128, handle_hash, handle_equal);
+    ddsrt_avl_init (&HANDLES_TREEDEF, &handles.ht);
     handles.count = 0;
     ddsrt_mutex_init (&handles.lock);
     ddsrt_cond_init (&handles.cond);
+    handles.initialized = true;
   }
   return DDS_RETCODE_OK;
 }
@@ -95,11 +93,11 @@ dds_return_t dds_handle_server_init (void)
 void dds_handle_server_fini (void)
 {
   /* called with ddsrt's singleton mutex held (see dds_init/fini) */
-  if (handles.ht != NULL)
+  if (handles.initialized)
   {
 #ifndef NDEBUG
-    struct ddsrt_hh_iter it;
-    for (struct dds_handle_link *link = ddsrt_hh_iter_first (handles.ht, &it); link != NULL; link = ddsrt_hh_iter_next (&it))
+    struct ddsrt_avl_iter it;
+    for (struct dds_handle_link *link = ddsrt_avl_iter_first (&HANDLES_TREEDEF, &handles.ht, &it); link != NULL; link = ddsrt_avl_iter_next (&it))
     {
       uint32_t cf = ddsrt_atomic_ld32 (&link->cnt_flags);
       DDS_ERROR ("handle %"PRId32" pin %"PRIu32" refc %"PRIu32"%s%s%s\n", link->hdl,
@@ -108,12 +106,12 @@ void dds_handle_server_fini (void)
                  cf & HDL_FLAG_CLOSING ? " closing" : "",
                  cf & HDL_FLAG_DELETE_DEFERRED ? " delete-deferred" : "");
     }
-    assert (ddsrt_hh_iter_first (handles.ht, &it) == NULL);
+    assert (ddsrt_avl_iter_first (&HANDLES_TREEDEF, &handles.ht, &it) == NULL);
 #endif
-    ddsrt_hh_free (handles.ht);
+    ddsrt_avl_free (&HANDLES_TREEDEF, &handles.ht, NULL);
     ddsrt_cond_destroy (&handles.cond);
     ddsrt_mutex_destroy (&handles.lock);
-    handles.ht = NULL;
+    handles.initialized = false;
   }
 }
 
@@ -124,11 +122,16 @@ static dds_handle_t dds_handle_create_int (struct dds_handle_link *link, bool im
   flags |= refc_counts_children ? HDL_FLAG_ALLOW_CHILDREN : 0;
   flags |= user_access ? 0 : HDL_FLAG_NO_USER_ACCESS;
   ddsrt_atomic_st32 (&link->cnt_flags, flags | 1u);
-  do {
+  while (true) {
     do {
       link->hdl = (int32_t) (ddsrt_random () & INT32_MAX);
     } while (link->hdl == 0 || link->hdl >= DDS_MIN_PSEUDO_HANDLE);
-  } while (!ddsrt_hh_add (handles.ht, link));
+    ddsrt_avl_ipath_t insertion_path;
+    if (ddsrt_avl_lookup_ipath(&HANDLES_TREEDEF, &handles.ht, link, &insertion_path) == NULL) {
+      ddsrt_avl_insert_ipath (&HANDLES_TREEDEF, &handles.ht, link, &insertion_path);
+      break;
+    }
+  }
   return link->hdl;
 }
 
@@ -167,10 +170,16 @@ dds_return_t dds_handle_register_special (struct dds_handle_link *link, bool imp
     handles.count++;
     ddsrt_atomic_st32 (&link->cnt_flags, HDL_FLAG_PENDING | (implicit ? HDL_FLAG_IMPLICIT : HDL_REFCOUNT_UNIT) | (allow_children ? HDL_FLAG_ALLOW_CHILDREN : 0) | 1u);
     link->hdl = handle;
-    if (ddsrt_hh_add (handles.ht, link))
+
+    ddsrt_avl_ipath_t insertion_path;
+    if (ddsrt_avl_lookup_ipath(&HANDLES_TREEDEF, &handles.ht, link, &insertion_path) == NULL) 
+    {
+      ddsrt_avl_insert_ipath (&HANDLES_TREEDEF, &handles.ht, link, &insertion_path);
       ret = handle;
-    else
+    } else {
       ret = DDS_RETCODE_BAD_PARAMETER;
+    }
+
     ddsrt_mutex_unlock (&handles.lock);
     assert (ret > 0);
   }
@@ -203,7 +212,7 @@ int32_t dds_handle_delete (struct dds_handle_link *link)
   assert ((cf & HDL_PINCOUNT_MASK) == 1u);
 #endif
   ddsrt_mutex_lock (&handles.lock);
-  ddsrt_hh_remove_present (handles.ht, link);
+  ddsrt_avl_delete (&HANDLES_TREEDEF, &handles.ht, link);
   assert (handles.count > 0);
   handles.count--;
   ddsrt_mutex_unlock (&handles.lock);
@@ -222,11 +231,11 @@ static int32_t dds_handle_pin_int (dds_handle_t hdl, uint32_t delta, bool from_u
 
      One could check that the handle is > 0, but that would catch fewer errors
      without any advantages. */
-  if (handles.ht == NULL)
+  if (!handles.initialized)
     return DDS_RETCODE_PRECONDITION_NOT_MET;
 
   ddsrt_mutex_lock (&handles.lock);
-  *link = ddsrt_hh_lookup (handles.ht, &dummy);
+  *link = ddsrt_avl_lookup (&HANDLES_TREEDEF, &handles.ht, &dummy);
   if (*link == NULL)
     rc = DDS_RETCODE_BAD_PARAMETER;
   else
@@ -278,11 +287,11 @@ int32_t dds_handle_pin_for_delete (dds_handle_t hdl, bool explicit, bool from_us
 
      One could check that the handle is > 0, but that would catch fewer errors
      without any advantages. */
-  if (handles.ht == NULL)
+  if (!handles.initialized)
     return DDS_RETCODE_PRECONDITION_NOT_MET;
 
   ddsrt_mutex_lock (&handles.lock);
-  *link = ddsrt_hh_lookup (handles.ht, &dummy);
+  *link = ddsrt_avl_lookup (&HANDLES_TREEDEF, &handles.ht, &dummy);
   if (*link == NULL)
     rc = DDS_RETCODE_BAD_PARAMETER;
   else

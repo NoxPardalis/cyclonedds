@@ -13,7 +13,7 @@
 #include "dds/ddsrt/sync.h"
 #include "dds/ddsrt/heap.h"
 #include "dds/ddsrt/threads.h"
-#include "dds/ddsrt/hopscotch.h"
+#include "dds/ddsrt/avl.h"
 #include "dds/ddsrt/environ.h"
 
 #include "test_common.h"
@@ -23,6 +23,31 @@
 #define N_READERS 4
 #define N_ROUNDS 100
 #define DEPTH 7
+
+struct wrinfo {
+  ddsrt_avl_node_t avlnode;
+  uint32_t rdid;
+  uint32_t wrid;
+  dds_instance_handle_t wr_iid;
+  bool last_not_alive;
+  uint32_t seen;
+};
+
+static int wrinfo_compare(const void *va, const void *vb)
+{
+  const struct wrinfo *a = va;
+  const struct wrinfo *b = vb;
+  // TODO any reason to prefer rdid as higher priority in sorting than wrid?
+  int ordering = (a->rdid > b->rdid) - (a->rdid < b->rdid);
+  if (ordering == 0)
+  {
+    // Compare against writer id.
+    ordering = (a->wrid > b->wrid) - (a->wrid < b->wrid);
+  }
+  return ordering;
+}
+
+static ddsrt_avl_treedef_t WRINFO_TREEDEF = DDSRT_AVL_TREEDEF_INITIALIZER(offsetof(struct wrinfo, avlnode), 0, wrinfo_compare, NULL);
 
 static dds_return_t get_matched_count_writers (uint32_t *count, dds_entity_t writers[N_WRITERS])
 {
@@ -150,28 +175,6 @@ static uint32_t createwriter_publisher (void *varg)
   return 0;
 }
 
-struct wrinfo {
-  uint32_t rdid;
-  uint32_t wrid;
-  dds_instance_handle_t wr_iid;
-  bool last_not_alive;
-  uint32_t seen;
-};
-
-static uint32_t wrinfo_hash (const void *va)
-{
-  const struct wrinfo *a = va;
-  return (uint32_t) (((a->rdid + UINT64_C (16292676669999574021)) *
-                      (a->wrid + UINT64_C (10242350189706880077))) >> 32);
-}
-
-static bool wrinfo_eq (const void *va, const void *vb)
-{
-  const struct wrinfo *a = va;
-  const struct wrinfo *b = vb;
-  return a->rdid == b->rdid && a->wrid == b->wrid;
-}
-
 #define LOGDEPTH 30
 #define LOGLINE 200
 
@@ -193,7 +196,7 @@ static void dumplog (struct logbuf *logbuf)
   fflush (stdout);
 }
 
-static bool checksample (struct ddsrt_hh *wrinfo, const dds_sample_info_t *si, const DiscStress_CreateWriter_Msg *s, struct logbuf *logbuf, uint32_t rdid)
+static bool checksample (ddsrt_avl_treedef_t *wrinfo_tree, ddsrt_avl_tree_t *wrinfo, const dds_sample_info_t *si, const DiscStress_CreateWriter_Msg *s, struct logbuf *logbuf, uint32_t rdid)
 {
   /* Cyclone always sets the key value, other fields are 0 for invalid data */
   struct wrinfo *wri;
@@ -202,15 +205,19 @@ static bool checksample (struct ddsrt_hh *wrinfo, const dds_sample_info_t *si, c
   CU_ASSERT_FATAL (s->wridx < N_WRITERS);
   CU_ASSERT_FATAL (s->histidx < DEPTH);
 
-  if ((wri = ddsrt_hh_lookup (wrinfo, &(struct wrinfo){ .wrid = s->wrseq, .rdid = rdid })) == NULL)
+  if ((wri = ddsrt_avl_lookup (wrinfo_tree, wrinfo, &(struct wrinfo){ .wrid = s->wrseq, .rdid = rdid })) == NULL)
   {
     wri = malloc (sizeof (*wri));
     assert (wri);
     memset (wri, 0, sizeof (*wri));
     wri->wrid = s->wrseq;
     wri->rdid = rdid;
-    const int ok = ddsrt_hh_add (wrinfo, wri);
-    CU_ASSERT_FATAL (ok);
+
+    ddsrt_avl_ipath_t insertion_path;
+    if (ddsrt_avl_lookup_ipath(wrinfo_tree, wrinfo, wri, &insertion_path) == NULL)
+    {
+      ddsrt_avl_insert_ipath (wrinfo_tree, wrinfo, wri, &insertion_path);
+    }
   }
 
   snprintf (logbuf->line[logbuf->logidx], sizeof (logbuf->line[logbuf->logidx]),
@@ -319,7 +326,8 @@ static uint32_t createwriter_subscriber (void *varg)
   /* Loop while we have some matching writers */
   printf ("--- Checking data ...\n");
   fflush (stdout);
-  struct ddsrt_hh *wrinfo = ddsrt_hh_new (1, wrinfo_hash, wrinfo_eq);
+  ddsrt_avl_tree_t wrinfo;
+  ddsrt_avl_init (&WRINFO_TREEDEF, &wrinfo);
   dds_entity_t xreader = 0;
   bool matched = true;
   struct logbuf logbuf[N_READERS];
@@ -378,7 +386,7 @@ static uint32_t createwriter_subscriber (void *varg)
           DiscStress_CreateWriter_Msg const * const s = raw[j];
           if (si[j].valid_data && s->round >= 0)
           {
-            if (!checksample (wrinfo, &si[j], s, &logbuf[xs[i]], (uint32_t)xs[i]))
+            if (!checksample (&WRINFO_TREEDEF, &wrinfo, &si[j], s, &logbuf[xs[i]], (uint32_t)xs[i]))
               error = true;
           }
         }
@@ -414,9 +422,9 @@ static uint32_t createwriter_subscriber (void *varg)
   dds_delete_qos (qos);
 
   int err = 0;
-  struct ddsrt_hh_iter it;
+  struct ddsrt_avl_iter it;
   uint32_t nwri = 0;
-  for (struct wrinfo *wri = ddsrt_hh_iter_first (wrinfo, &it); wri; wri = ddsrt_hh_iter_next (&it))
+  for (struct wrinfo *wri = ddsrt_avl_iter_first (&WRINFO_TREEDEF, &wrinfo, &it); wri; wri = ddsrt_avl_iter_next (&it))
   {
     nwri++;
     if (wri->seen != (1u << DEPTH) - 1)
@@ -428,7 +436,7 @@ static uint32_t createwriter_subscriber (void *varg)
     /* simple iteration won't touch an object pointer twice */
     free (wri);
   }
-  ddsrt_hh_free (wrinfo);
+  ddsrt_avl_free (&WRINFO_TREEDEF, &wrinfo, NULL);
   CU_ASSERT_FATAL (err == 0);
   CU_ASSERT_FATAL (nwri >= (N_ROUNDS / 3) * N_READERS * N_WRITERS);
   printf ("--- Done after %"PRIu32" sets\n", nwri / (N_READERS * N_WRITERS));

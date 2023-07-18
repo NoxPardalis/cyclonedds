@@ -237,7 +237,7 @@ static void delete_topic_definition_locked (struct ddsi_topic_definition *tpd, d
 {
   struct ddsi_domaingv *gv = tpd->gv;
   GVLOGDISC ("delete_topic_definition_locked (%p) ", tpd);
-  ddsrt_hh_remove_present (gv->topic_defs, tpd);
+  ddsrt_avl_delete (&gv->topic_defs_treedef, &gv->topic_defs, tpd);
   GVLOGDISC ("- deleting\n");
   gcreq_topic_definition (tpd, timestamp);
 }
@@ -293,7 +293,7 @@ static struct ddsi_topic_definition * ref_topic_definition_locked (struct ddsi_d
     .gv = gv
   };
   set_ddsi_topic_definition_hash (&templ);
-  struct ddsi_topic_definition *tpd = ddsrt_hh_lookup (gv->topic_defs, &templ);
+  struct ddsi_topic_definition *tpd = ddsrt_avl_lookup (&gv->topic_defs_treedef, &gv->topic_defs, &templ);
   ddsi_type_pair_free (templ.type_pair);
   if (tpd) {
     tpd->refc++;
@@ -396,7 +396,7 @@ static struct ddsi_topic_definition * new_topic_definition (struct ddsi_domaingv
     GVLOGDISC ("}\n");
   }
 
-  ddsrt_hh_add_absent (gv->topic_defs, tpd);
+  ddsrt_avl_insert (&gv->topic_defs_treedef, &gv->topic_defs, tpd);
 err:
   return tpd;
 }
@@ -404,11 +404,11 @@ err:
 dds_return_t ddsi_lookup_topic_definition (struct ddsi_domaingv *gv, const char * topic_name, const ddsi_typeid_t *type_id, struct ddsi_topic_definition **tpd)
 {
   assert (tpd != NULL);
-  struct ddsrt_hh_iter it;
+  struct ddsrt_avl_iter it;
   dds_return_t ret = DDS_RETCODE_OK;
   *tpd = NULL;
   ddsrt_mutex_lock (&gv->topic_defs_lock);
-  for (struct ddsi_topic_definition *tpd1 = ddsrt_hh_iter_first (gv->topic_defs, &it); tpd1; tpd1 = ddsrt_hh_iter_next (&it))
+  for (struct ddsi_topic_definition *tpd1 = ddsrt_avl_iter_first (&gv->topic_defs_treedef, &gv->topic_defs, &it); tpd1; tpd1 = ddsrt_avl_iter_next (&it))
   {
     if (!strcmp (tpd1->xqos->topic_name, topic_name) &&
         (ddsi_typeid_is_none (type_id) || ((tpd1->xqos->present & DDSI_QP_TYPE_INFORMATION) && !ddsi_typeid_compare (type_id, ddsi_typeinfo_complete_typeid (tpd1->xqos->type_information)))))

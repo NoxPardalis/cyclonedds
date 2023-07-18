@@ -66,7 +66,7 @@ struct ddsi_sertype *ddsi_sertype_ref (const struct ddsi_sertype *sertype_const)
 
 struct ddsi_sertype *ddsi_sertype_lookup_locked (struct ddsi_domaingv *gv, const struct ddsi_sertype *sertype_template)
 {
-  struct ddsi_sertype *sertype = ddsrt_hh_lookup (gv->sertypes, sertype_template);
+  struct ddsi_sertype *sertype = ddsrt_avl_lookup (&gv->sertypes_treedef, &gv->sertypes, sertype_template);
 #ifndef NDEBUG
   if (sertype != NULL)
     assert ((ddsrt_atomic_ld32 (&sertype->flags_refc) & DDSI_SERTYPE_REFC_MASK) > 0);
@@ -88,7 +88,7 @@ void ddsi_sertype_register_locked (struct ddsi_domaingv *gv, struct ddsi_sertype
   ddsrt_atomic_stvoidp (&sertype->gv, gv);
   ddsrt_atomic_fence_stst ();
   ddsrt_atomic_or32 (&sertype->flags_refc, DDSI_SERTYPE_REGISTERED);
-  ddsrt_hh_add_absent (gv->sertypes, sertype);
+  ddsrt_avl_insert (&gv->sertypes_treedef, &gv->sertypes, sertype);
 }
 
 static void ddsi_sertype_unref_locked (struct ddsi_domaingv * const gv, struct ddsi_sertype *sertype)
@@ -105,7 +105,7 @@ static void ddsi_sertype_unref_locked (struct ddsi_domaingv * const gv, struct d
     else
     {
       if (flags_refc1 & DDSI_SERTYPE_REGISTERED)
-        ddsrt_hh_remove_present (gv->sertypes, sertype);
+        ddsrt_avl_delete (&gv->sertypes_treedef, &gv->sertypes, sertype);
       ddsi_sertype_free (sertype);
     }
   }
