@@ -446,8 +446,6 @@ int main (int argc, char **argv)
   }
 
   participant = dds_create_participant (DDS_DOMAIN_DEFAULT, NULL, NULL);
-  dds_delete(participant);
-  return 0;
   if (participant < 0)
   {
     fprintf (stderr, "dds_create_participant: %s\n", dds_strretcode (participant));
